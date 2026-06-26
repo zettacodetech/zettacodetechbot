@@ -12,6 +12,9 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -364,6 +367,79 @@ def admin_contact_text() -> str:
         f"Admin lichkasi: @{username}\n"
         f"To'g'ridan-to'g'ri yozish: https://t.me/{username}"
     )
+
+
+def contact_text() -> str:
+    username = admin_username()
+    return (
+        "ZettaCode Tech bilan aloqa:\n\n"
+        f"Telegram: @{username}\n"
+        "Telefon: +998-95-184-07-51\n"
+        "Kanal: @zettacodetech\n"
+        "Portfolio: https://toshmirzayev-inomjon.online/"
+    )
+
+
+def user_help_text() -> str:
+    return (
+        "Foydalanish uchun commandlar:\n\n"
+        "/start - asosiy menyu\n"
+        "/new - yangi buyurtma boshlash\n"
+        "/prices - xizmatlar narxlarini ko'rish\n"
+        "/portfolio - portfolio havolasi\n"
+        "/contact - admin bilan aloqa\n"
+        "/help - yordam\n"
+        "/cancel - joriy buyurtmani bekor qilish\n\n"
+        "Buyurtma berishda loyiha nima qilishi, foydalanuvchi va admin qanday amallarni bajarishi kerakligini batafsil yozing."
+    )
+
+
+def admin_help_text() -> str:
+    return (
+        "Admin commandlar:\n\n"
+        "/admin - admin panel\n"
+        "/orders - oxirgi buyurtmalar\n"
+        "/stats - buyurtmalar statistikasi\n"
+        "/ai - AI ulanish holati\n"
+        "/testorder - mijoz sifatida test buyurtma\n\n"
+        "User commandlar ham ishlaydi: /start, /prices, /portfolio, /contact, /help, /cancel."
+    )
+
+
+def user_bot_commands() -> list[BotCommand]:
+    return [
+        BotCommand(command="start", description="Asosiy menyu"),
+        BotCommand(command="new", description="Yangi buyurtma boshlash"),
+        BotCommand(command="prices", description="Narxlarni ko'rish"),
+        BotCommand(command="portfolio", description="Portfolioni ko'rish"),
+        BotCommand(command="contact", description="Admin bilan aloqa"),
+        BotCommand(command="help", description="Yordam"),
+        BotCommand(command="cancel", description="Buyurtmani bekor qilish"),
+    ]
+
+
+def admin_bot_commands() -> list[BotCommand]:
+    return [
+        BotCommand(command="start", description="Admin panel"),
+        BotCommand(command="admin", description="Admin panelni ochish"),
+        BotCommand(command="orders", description="Oxirgi buyurtmalar"),
+        BotCommand(command="stats", description="Statistika"),
+        BotCommand(command="ai", description="AI holati"),
+        BotCommand(command="testorder", description="Mijoz sifatida test"),
+        BotCommand(command="prices", description="Narxlarni ko'rish"),
+        BotCommand(command="help", description="Yordam"),
+        BotCommand(command="cancel", description="Joriy jarayonni bekor qilish"),
+    ]
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    try:
+        await bot.set_my_commands(user_bot_commands(), scope=BotCommandScopeDefault())
+        admin_id = admin_chat_id()
+        if admin_id is not None:
+            await bot.set_my_commands(admin_bot_commands(), scope=BotCommandScopeChat(chat_id=admin_id))
+    except Exception as exc:
+        logging.warning("Bot command menyusini sozlab bo'lmadi: %s", exc)
 
 
 def is_admin_user(user_id: int) -> bool:
@@ -1000,6 +1076,20 @@ def prices_inline_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def contact_inline_keyboard() -> InlineKeyboardMarkup:
+    username = admin_username()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Admin", url=f"https://t.me/{username}"),
+                InlineKeyboardButton(text="Portfolio", url="https://toshmirzayev-inomjon.online/"),
+            ],
+            [InlineKeyboardButton(text="Kanal", url="https://t.me/zettacodetech")],
+            [InlineKeyboardButton(text="Buyurtma berish", callback_data="menu:start_order")],
+        ]
+    )
+
+
 def requirements_keyboard(has_requirements: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="Yana talab qo'shish", callback_data="requirements:more")],
@@ -1146,6 +1236,17 @@ async def show_prices(message: Message) -> None:
     )
 
 
+async def show_contact(message: Message) -> None:
+    await message.answer(contact_text(), reply_markup=contact_inline_keyboard())
+
+
+async def show_portfolio(message: Message) -> None:
+    await message.answer(
+        "ZettaCode Tech portfolio:\nhttps://toshmirzayev-inomjon.online/",
+        reply_markup=contact_inline_keyboard(),
+    )
+
+
 async def show_project_menu(
     message: Message,
     user_id: int,
@@ -1184,6 +1285,41 @@ def format_order_detail(order: sqlite3.Row) -> str:
         f"Asosiy bandlar:\n{feature_text}\n\n"
         f"Talablar:\n{order['requirements']}"
     )
+
+
+def format_stats_text() -> str:
+    total, paid_sum, statuses = order_stats()
+    lines = [
+        "Buyurtmalar statistikasi:",
+        "",
+        f"Jami buyurtmalar: {total}",
+        f"Qabul qilingan umumiy qiymat: ${paid_sum}",
+        "",
+        "Holatlar:",
+    ]
+    if statuses:
+        lines.extend(
+            f"- {STATUS_LABELS.get(row['status'], row['status'])}: {row['count']}"
+            for row in statuses
+        )
+    else:
+        lines.append("- Hali ma'lumot yo'q")
+    return "\n".join(lines)
+
+
+def ai_status_text() -> str:
+    api_key = os.getenv("GROQ_API_KEY")
+    model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    status = "ulangan" if api_key else "ulanmagan"
+    return f"AI holati: {status}\nModel: {model}"
+
+
+async def show_orders(message: Message) -> None:
+    orders = latest_orders()
+    if not orders:
+        await message.answer("Hozircha buyurtmalar yo'q.", reply_markup=orders_keyboard([]))
+        return
+    await message.answer("Oxirgi buyurtmalar:", reply_markup=orders_keyboard(orders))
 
 
 async def ask_for_more_requirements(message: Message, session: UserSession, text: str | None = None) -> None:
@@ -1282,6 +1418,7 @@ async def main() -> None:
 
     bot = Bot(token=bot_token)
     dp = Dispatcher()
+    await setup_bot_commands(bot)
 
     @dp.message(CommandStart())
     async def start_handler(message: Message) -> None:
@@ -1308,6 +1445,67 @@ async def main() -> None:
             )
             return
         await show_project_menu(message, user_id=message.from_user.id, reset=True)
+
+    @dp.message(Command("prices"))
+    async def prices_handler(message: Message) -> None:
+        await show_prices(message)
+
+    @dp.message(Command("portfolio"))
+    async def portfolio_handler(message: Message) -> None:
+        await show_portfolio(message)
+
+    @dp.message(Command("contact"))
+    async def contact_handler(message: Message) -> None:
+        await show_contact(message)
+
+    @dp.message(Command("help"))
+    async def help_handler(message: Message) -> None:
+        if is_admin_user(message.from_user.id):
+            await message.answer(admin_help_text(), reply_markup=admin_panel_keyboard())
+            return
+        await message.answer(user_help_text(), reply_markup=welcome_inline_keyboard())
+
+    @dp.message(Command("cancel"))
+    async def cancel_handler(message: Message) -> None:
+        reset_session(message.from_user.id, is_admin_test=False)
+        await message.answer("Joriy buyurtma bekor qilindi.")
+        if is_admin_user(message.from_user.id):
+            await show_admin_panel(message)
+        else:
+            await show_main_menu(message, user_id=message.from_user.id)
+
+    @dp.message(Command("orders"))
+    async def orders_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await show_orders(message)
+
+    @dp.message(Command("stats"))
+    async def stats_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await message.answer(format_stats_text(), reply_markup=admin_panel_keyboard())
+
+    @dp.message(Command("ai"))
+    async def ai_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await message.answer(ai_status_text(), reply_markup=admin_panel_keyboard())
+
+    @dp.message(Command("testorder"))
+    async def test_order_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await show_project_menu(
+            message,
+            user_id=message.from_user.id,
+            reset=True,
+            is_admin_test=True,
+        )
 
     @dp.callback_query(F.data.startswith("menu:"))
     async def menu_callback(callback: CallbackQuery) -> None:
@@ -1432,37 +1630,18 @@ async def main() -> None:
             return
 
         if action == "stats":
-            total, paid_sum, statuses = order_stats()
-            lines = [
-                "Buyurtmalar statistikasi:",
-                "",
-                f"Jami buyurtmalar: {total}",
-                f"Qabul qilingan umumiy qiymat: ${paid_sum}",
-                "",
-                "Holatlar:",
-            ]
-            if statuses:
-                lines.extend(
-                    f"- {STATUS_LABELS.get(row['status'], row['status'])}: {row['count']}"
-                    for row in statuses
-                )
-            else:
-                lines.append("- Hali ma'lumot yo'q")
             await safe_edit_or_answer(
                 callback,
-                "\n".join(lines),
+                format_stats_text(),
                 reply_markup=admin_panel_keyboard(),
             )
             await callback.answer()
             return
 
         if action == "ai_status":
-            api_key = os.getenv("GROQ_API_KEY")
-            model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-            status = "ulangan" if api_key else "ulanmagan"
             await safe_edit_or_answer(
                 callback,
-                f"AI holati: {status}\nModel: {model}",
+                ai_status_text(),
                 reply_markup=admin_panel_keyboard(),
             )
             await callback.answer()

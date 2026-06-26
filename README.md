@@ -40,9 +40,23 @@ python main.py
 
 ## Buyruqlar
 
+User commandlar:
+
 - `/start` - botni boshlash
 - `/new` - yangi buyurtma boshlash
+- `/prices` - xizmatlar narxlarini ko'rish
+- `/portfolio` - portfolio havolasi
+- `/contact` - admin bilan aloqa
+- `/help` - yordam
+- `/cancel` - joriy buyurtmani bekor qilish
+
+Admin commandlar:
+
 - `/admin` - admin panel
+- `/orders` - oxirgi buyurtmalar
+- `/stats` - buyurtmalar statistikasi
+- `/ai` - AI ulanish holati
+- `/testorder` - mijoz sifatida test buyurtma
 
 ## Tugmalar
 
