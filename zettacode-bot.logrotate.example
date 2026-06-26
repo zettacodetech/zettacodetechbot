@@ -1,0 +1,8 @@
+/home/inomjon/zettacode-sales-bot/bot.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

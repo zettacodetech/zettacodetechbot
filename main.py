@@ -1,17 +1,21 @@
 import asyncio
 import csv
+import html
 import io
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Set
+from unicodedata import normalize
 
 import aiohttp
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
@@ -92,6 +96,15 @@ STATUS_LABELS = {
     "rejected": "To'lov tasdiqlanmadi",
 }
 
+PIPELINE_STAGES = {
+    "new": "Yangi",
+    "requirements": "Talab olinmoqda",
+    "priced": "Narx berildi",
+    "prepayment": "Predoplata",
+    "in_progress": "Ish boshlandi",
+    "done": "Tugatildi",
+}
+
 COMPLEXITY_RULES = [
     (("admin", "panel", "dashboard"), 150),
     (("tolov", "payment", "naqd", "naxd", "cash"), 75),
@@ -169,6 +182,8 @@ CANCEL_TEXT = "Bekor qilish"
 CALCULATE_TEXT = "Narxni hisoblash"
 RATE_LIMIT_WINDOW_SECONDS = 8
 RATE_LIMIT_MAX_MESSAGES = 8
+DEFAULT_REMINDER_AFTER_HOURS = 24
+WEB_ADMIN_DEFAULT_PORT = 8088
 PROMO_CODES = {
     "ZETTA10": 10,
     "START5": 5,
@@ -214,6 +229,8 @@ class UserSession:
     ai_summary: str = ""
     ai_features: list[str] = field(default_factory=list)
     ai_used: bool = False
+    estimated_duration: str = ""
+    lead_score: str = ""
     is_admin_test: bool = False
     asked_questions: int = 0
     off_topic_count: int = 0
@@ -221,6 +238,7 @@ class UserSession:
     pending_note_order_id: int | None = None
     pending_search_query: str = ""
     pending_broadcast_text: str = ""
+    pending_task_order_id: int | None = None
     promo_code: str = ""
     promo_discount_percent: int = 0
 
@@ -241,6 +259,15 @@ def db_connect() -> sqlite3.Connection:
     connection = sqlite3.connect(db_path())
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db() -> None:
@@ -266,6 +293,12 @@ def init_db() -> None:
             )
             """
         )
+        ensure_column(connection, "orders", "pipeline_stage", "TEXT NOT NULL DEFAULT 'new'")
+        ensure_column(connection, "orders", "deadline", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(connection, "orders", "assignee", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(connection, "orders", "reminded_at", "TEXT")
+        ensure_column(connection, "orders", "lead_score", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(connection, "orders", "estimated_duration", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -274,6 +307,20 @@ def init_db() -> None:
                 username TEXT,
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                task TEXT NOT NULL,
+                assignee TEXT NOT NULL DEFAULT '',
+                deadline TEXT NOT NULL DEFAULT '',
+                done INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
             """
         )
@@ -323,9 +370,10 @@ def create_order(user: User, session: UserSession) -> int:
             """
             INSERT INTO orders (
                 user_id, full_name, username, projects, requirements, estimate, prepayment,
-                ai_summary, ai_features, ai_used, status, created_at, updated_at
+                ai_summary, ai_features, ai_used, status, pipeline_stage, lead_score,
+                estimated_duration, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user.id,
@@ -339,6 +387,9 @@ def create_order(user: User, session: UserSession) -> int:
                 json.dumps(session.ai_features, ensure_ascii=False),
                 1 if session.ai_used else 0,
                 "payment_confirmation",
+                "priced",
+                session.lead_score,
+                session.estimated_duration,
                 now,
                 now,
             ),
@@ -378,6 +429,42 @@ def update_order_price(order_id: int | None, estimate: int, prepayment: int) -> 
         )
 
 
+def update_order_metadata(
+    order_id: int | None,
+    *,
+    pipeline_stage: str | None = None,
+    deadline: str | None = None,
+    assignee: str | None = None,
+    lead_score: str | None = None,
+    estimated_duration: str | None = None,
+    reminded_at: str | None = None,
+) -> None:
+    if order_id is None:
+        return
+
+    fields = ["updated_at = ?"]
+    values: list[Any] = [utc_now()]
+    updates = {
+        "pipeline_stage": pipeline_stage,
+        "deadline": deadline,
+        "assignee": assignee,
+        "lead_score": lead_score,
+        "estimated_duration": estimated_duration,
+        "reminded_at": reminded_at,
+    }
+    for column, value in updates.items():
+        if value is not None:
+            fields.append(f"{column} = ?")
+            values.append(value)
+    values.append(order_id)
+
+    with db_connect() as connection:
+        connection.execute(
+            f"UPDATE orders SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+
+
 def get_order(order_id: int) -> sqlite3.Row | None:
     with db_connect() as connection:
         return connection.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
@@ -399,6 +486,16 @@ def latest_orders_by_status(status: str, limit: int = 8) -> list[sqlite3.Row]:
             connection.execute(
                 "SELECT * FROM orders WHERE status = ? ORDER BY id DESC LIMIT ?",
                 (status, limit),
+            ).fetchall()
+        )
+
+
+def latest_orders_by_pipeline(stage: str, limit: int = 8) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT * FROM orders WHERE pipeline_stage = ? ORDER BY id DESC LIMIT ?",
+                (stage, limit),
             ).fetchall()
         )
 
@@ -463,6 +560,40 @@ def add_order_note(order_id: int, admin_id: int, note: str) -> bool:
     return True
 
 
+def add_order_task(order_id: int, task: str, assignee: str = "", deadline: str = "") -> bool:
+    if get_order(order_id) is None:
+        return False
+    now = utc_now()
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO order_tasks (order_id, task, assignee, deadline, done, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?)
+            """,
+            (order_id, task.strip(), assignee.strip(), deadline.strip(), now, now),
+        )
+    return True
+
+
+def order_tasks(order_id: int, include_done: bool = False) -> list[sqlite3.Row]:
+    query = "SELECT * FROM order_tasks WHERE order_id = ?"
+    values: list[Any] = [order_id]
+    if not include_done:
+        query += " AND done = 0"
+    query += " ORDER BY id DESC LIMIT 10"
+    with db_connect() as connection:
+        return list(connection.execute(query, values).fetchall())
+
+
+def mark_task_done(task_id: int) -> bool:
+    with db_connect() as connection:
+        cursor = connection.execute(
+            "UPDATE order_tasks SET done = 1, updated_at = ? WHERE id = ?",
+            (utc_now(), task_id),
+        )
+        return cursor.rowcount > 0
+
+
 def order_stats() -> tuple[int, int, list[sqlite3.Row]]:
     with db_connect() as connection:
         total = connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
@@ -475,6 +606,15 @@ def order_stats() -> tuple[int, int, list[sqlite3.Row]]:
             ).fetchall()
         )
         return int(total), int(paid_sum), statuses
+
+
+def pipeline_stats() -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT pipeline_stage, COUNT(*) AS count FROM orders GROUP BY pipeline_stage ORDER BY count DESC"
+            ).fetchall()
+        )
 
 
 def service_stats() -> list[tuple[str, int]]:
@@ -497,6 +637,23 @@ def all_user_ids() -> list[int]:
         ]
 
 
+def pending_reminder_orders(after_hours: int) -> list[sqlite3.Row]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=after_hours)
+    rows = latest_orders(limit=200)
+    pending_statuses = {"payment_confirmation", "awaiting_receipt", "admin_contact"}
+    result = []
+    for row in rows:
+        if row["status"] not in pending_statuses or row["reminded_at"]:
+            continue
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+        except ValueError:
+            continue
+        if created_at <= cutoff:
+            result.append(row)
+    return result
+
+
 def export_orders_csv_bytes() -> bytes:
     with db_connect() as connection:
         rows = list(connection.execute("SELECT * FROM orders ORDER BY id DESC").fetchall())
@@ -513,6 +670,9 @@ def export_orders_csv_bytes() -> bytes:
             "estimate",
             "prepayment",
             "status",
+            "pipeline_stage",
+            "lead_score",
+            "estimated_duration",
             "created_at",
             "updated_at",
             "requirements",
@@ -529,6 +689,9 @@ def export_orders_csv_bytes() -> bytes:
                 row["estimate"],
                 row["prepayment"],
                 STATUS_LABELS.get(row["status"], row["status"]),
+                PIPELINE_STAGES.get(row["pipeline_stage"], row["pipeline_stage"]),
+                row["lead_score"],
+                row["estimated_duration"],
                 row["created_at"],
                 row["updated_at"],
                 row["requirements"],
@@ -642,6 +805,7 @@ def user_help_text() -> str:
         "/portfolio - portfolio havolasi\n"
         "/contact - admin bilan aloqa\n"
         "/status - oxirgi buyurtma holati\n"
+        "/invoice - oxirgi buyurtma invoice PDF\n"
         "/faq - ko'p beriladigan savollar\n"
         "/promo PROMOKOD - promo kod kiritish\n"
         "/help - yordam\n"
@@ -661,12 +825,20 @@ def admin_help_text() -> str:
         "/search matn - buyurtma qidirish\n"
         "/note ID izoh - buyurtmaga ichki izoh qo'shish\n"
         "/draft ID - texnik topshiriq drafti\n"
+        "/invoice ID - invoice PDF\n"
+        "/stage ID BOSQICH - CRM bosqichini o'zgartirish\n"
+        "/task ID matn - buyurtmaga vazifa qo'shish\n"
+        "/tasks ID - vazifalar ro'yxati\n"
+        "/done TASK_ID - vazifani yopish\n"
+        "/deadline ID YYYY-MM-DD - deadline qo'yish\n"
+        "/assign ID ism - mas'ul biriktirish\n"
+        "/web - web admin panel havolasi\n"
         "/export - buyurtmalarni CSV qilish\n"
         "/broadcast matn - hammaga xabar yuborish\n"
         "/block USER_ID sabab - foydalanuvchini bloklash\n"
         "/unblock USER_ID - blokdan chiqarish\n"
         "/backup - database backup faylini olish\n\n"
-        "User commandlar ham ishlaydi: /start, /prices, /portfolio, /contact, /status, /faq, /promo, /help, /cancel."
+        "User commandlar ham ishlaydi: /start, /prices, /portfolio, /contact, /status, /invoice, /faq, /promo, /help, /cancel."
     )
 
 
@@ -678,6 +850,7 @@ def user_bot_commands() -> list[BotCommand]:
         BotCommand(command="portfolio", description="Portfolioni ko'rish"),
         BotCommand(command="contact", description="Admin bilan aloqa"),
         BotCommand(command="status", description="Buyurtma holati"),
+        BotCommand(command="invoice", description="Invoice PDF"),
         BotCommand(command="faq", description="Savol-javob"),
         BotCommand(command="promo", description="Promo kod kiritish"),
         BotCommand(command="help", description="Yordam"),
@@ -694,6 +867,14 @@ def admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="search", description="Buyurtma qidirish"),
         BotCommand(command="note", description="Buyurtmaga izoh"),
         BotCommand(command="draft", description="TT draft"),
+        BotCommand(command="invoice", description="Invoice PDF"),
+        BotCommand(command="stage", description="CRM bosqich"),
+        BotCommand(command="task", description="Vazifa qo'shish"),
+        BotCommand(command="tasks", description="Vazifalar"),
+        BotCommand(command="done", description="Vazifani yopish"),
+        BotCommand(command="deadline", description="Deadline"),
+        BotCommand(command="assign", description="Mas'ul"),
+        BotCommand(command="web", description="Web admin panel"),
         BotCommand(command="export", description="CSV export"),
         BotCommand(command="broadcast", description="Hammaga xabar"),
         BotCommand(command="block", description="User bloklash"),
@@ -885,6 +1066,39 @@ def complexity_label(session: UserSession, estimate: int | None = None) -> str:
     if actual_estimate >= base_price + 150:
         return "O'rta"
     return "Oddiy"
+
+
+def estimate_duration_label(session: UserSession, estimate: int | None = None) -> str:
+    label = complexity_label(session, estimate)
+    project_count = len(ordered_project_keys(session.selected_projects))
+    if label == "Murakkab" or project_count >= 3:
+        return "14-30 kun"
+    if label == "O'rta" or project_count == 2:
+        return "7-14 kun"
+    return "3-7 kun"
+
+
+def lead_score_label(session: UserSession, estimate: int | None = None) -> str:
+    score = 0
+    text = session.requirements.lower()
+    if len(session.requirements) >= 180:
+        score += 2
+    elif len(session.requirements) >= 90:
+        score += 1
+    if any(word in text for word in ("tez", "bugun", "ertaga", "shoshilinch", "boshlash")):
+        score += 2
+    if any(word in text for word in ("admin panel", "crm", "buyurtma", "katalog", "dostavka", "hisobot")):
+        score += 1
+    if estimate and estimate >= 600:
+        score += 1
+    if session.promo_code:
+        score += 1
+
+    if score >= 5:
+        return "Issiq lead"
+    if score >= 3:
+        return "O'rta lead"
+    return "Sovuq lead"
 
 
 def detect_project_keys(text: str) -> list[str]:
@@ -1511,6 +1725,7 @@ def payment_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Yo'q", callback_data="payment:no"),
             ],
             [InlineKeyboardButton(text="Talablarni tahrirlash", callback_data="payment:edit")],
+            [InlineKeyboardButton(text="Invoice PDF", callback_data="payment:invoice")],
         ]
     )
 
@@ -1550,6 +1765,10 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="To'langan", callback_data="panel:orders:paid"),
                 InlineKeyboardButton(text="Rad etilgan", callback_data="panel:orders:rejected"),
             ],
+            [
+                InlineKeyboardButton(text="Pipeline: Narx", callback_data="panel:pipeline:priced"),
+                InlineKeyboardButton(text="Pipeline: Ish", callback_data="panel:pipeline:in_progress"),
+            ],
             [InlineKeyboardButton(text="Statistika", callback_data="panel:stats")],
             [
                 InlineKeyboardButton(text="CSV export", callback_data="panel:export"),
@@ -1559,6 +1778,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Broadcast", callback_data="panel:broadcast"),
                 InlineKeyboardButton(text="AI holati", callback_data="panel:ai_status"),
             ],
+            [InlineKeyboardButton(text="Web panel", url=web_admin_url())],
             [InlineKeyboardButton(text="Mijoz sifatida test", callback_data="panel:test_order")],
         ]
     )
@@ -1622,6 +1842,18 @@ def order_detail_keyboard(order: sqlite3.Row) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="TT draft", callback_data=f"panel:draft:{order['id']}"),
             InlineKeyboardButton(text="Izoh qo'shish", callback_data=f"panel:note:{order['id']}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="Invoice PDF", callback_data=f"panel:invoice:{order['id']}"),
+            InlineKeyboardButton(text="Task qo'shish", callback_data=f"panel:task:{order['id']}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="Ish boshlandi", callback_data=f"panel:stage:{order['id']}:in_progress"),
+            InlineKeyboardButton(text="Tugatildi", callback_data=f"panel:stage:{order['id']}:done"),
         ]
     )
     rows.append([InlineKeyboardButton(text="Buyurtmalar", callback_data="panel:orders")])
@@ -1801,23 +2033,41 @@ def format_features(features: list[str]) -> str:
 
 def format_order_detail(order: sqlite3.Row) -> str:
     status = STATUS_LABELS.get(order["status"], order["status"])
+    pipeline = PIPELINE_STAGES.get(order["pipeline_stage"], order["pipeline_stage"])
     features = json.loads(order["ai_features"] or "[]")
     feature_text = format_features(features) if features else "-"
     username = f"@{order['username']}" if order["username"] else "username yo'q"
     ai_label = "AI tahlil" if order["ai_used"] else "Tahlil"
     notes = order_notes(order["id"])
     notes_text = "\n".join(f"- {note['note']}" for note in notes) if notes else "-"
+    tasks = order_tasks(order["id"])
+    tasks_text = (
+        "\n".join(
+            f"- #{task['id']} {task['task']}"
+            + (f" | {task['assignee']}" if task["assignee"] else "")
+            + (f" | deadline: {task['deadline']}" if task["deadline"] else "")
+            for task in tasks
+        )
+        if tasks
+        else "-"
+    )
     return (
         f"Buyurtma #{order['id']}\n\n"
         f"Holat: {status}\n"
+        f"CRM bosqich: {pipeline}\n"
         f"Mijoz ID: {order['user_id']}\n"
         f"Mijoz: {order['full_name']} ({username})\n"
         f"Loyiha turi: {projects_from_order(order)}\n"
         f"Murakkablik: {complexity_label_for_order(order)}\n"
+        f"Taxminiy muddat: {order['estimated_duration'] or '-'}\n"
+        f"Lead score: {order['lead_score'] or '-'}\n"
+        f"Mas'ul: {order['assignee'] or '-'}\n"
+        f"Deadline: {order['deadline'] or '-'}\n"
         f"Taxminiy narx: ${order['estimate']}\n"
         f"50% predoplata: ${order['prepayment']}\n\n"
         f"{ai_label}: {order['ai_summary']}\n"
         f"Asosiy bandlar:\n{feature_text}\n\n"
+        f"Tasklar:\n{tasks_text}\n\n"
         f"Admin izohlari:\n{notes_text}\n\n"
         f"Talablar:\n{order['requirements']}"
     )
@@ -1825,6 +2075,7 @@ def format_order_detail(order: sqlite3.Row) -> str:
 
 def format_stats_text() -> str:
     total, paid_sum, statuses = order_stats()
+    pipelines = pipeline_stats()
     services = service_stats()
     lines = [
         "Buyurtmalar statistikasi:",
@@ -1844,6 +2095,12 @@ def format_stats_text() -> str:
     if services:
         lines.extend(["", "Xizmatlar bo'yicha:"])
         lines.extend(f"- {title}: {count}" for title, count in services)
+    if pipelines:
+        lines.extend(["", "CRM pipeline:"])
+        lines.extend(
+            f"- {PIPELINE_STAGES.get(row['pipeline_stage'], row['pipeline_stage'])}: {row['count']}"
+            for row in pipelines
+        )
     return "\n".join(lines)
 
 
@@ -1966,6 +2223,218 @@ async def send_long_message(message: Message, text: str) -> None:
         await message.answer(text[index : index + chunk_size])
 
 
+async def notify_admins(
+    bot: Bot,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    for admin_id in admin_chat_ids():
+        try:
+            await bot.send_message(admin_id, text, reply_markup=reply_markup)
+        except Exception as exc:
+            logging.warning("Adminga xabar yuborilmadi (%s): %s", admin_id, exc)
+
+
+def pdf_safe_text(text: str) -> str:
+    cleaned = normalize("NFKD", text).encode("latin-1", "ignore").decode("latin-1")
+    return cleaned.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def simple_pdf_bytes(title: str, lines: list[str]) -> bytes:
+    visible_lines = [title, ""] + lines
+    content_lines = ["BT", "/F1 10 Tf", "50 790 Td", "14 TL"]
+    for line in visible_lines[:55]:
+        content_lines.append(f"({pdf_safe_text(line)}) Tj")
+        content_lines.append("T*")
+    content_lines.append("ET")
+    stream = "\n".join(content_lines).encode("latin-1", "ignore")
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{index} 0 obj\n".encode("ascii"))
+        pdf.extend(obj)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(pdf)
+
+
+def invoice_lines(order: sqlite3.Row) -> list[str]:
+    return [
+        f"Invoice: ZettaCode Tech buyurtma #{order['id']}",
+        f"Mijoz: {order['full_name']} (@{order['username'] or 'username yoq'})",
+        f"Loyiha turi: {projects_from_order(order)}",
+        f"CRM bosqich: {PIPELINE_STAGES.get(order['pipeline_stage'], order['pipeline_stage'])}",
+        f"Lead score: {order['lead_score'] or '-'}",
+        f"Taxminiy muddat: {order['estimated_duration'] or '-'}",
+        f"Umumiy taxminiy narx: ${order['estimate']}",
+        f"50% predoplata: ${order['prepayment']}",
+        "",
+        "Tolov sharti:",
+        "Loyiha boshlanishi uchun 50% predoplata plastik karta orqali qabul qilinadi.",
+        "Loyiha ichidagi tolov funksiyasi faqat naqd tolov sifatida korib chiqiladi.",
+        "",
+        "Talablar:",
+        *(order["requirements"].splitlines()[:18] or ["-"]),
+    ]
+
+
+async def send_invoice_pdf(message: Message, order: sqlite3.Row) -> None:
+    data = simple_pdf_bytes(f"ZettaCode Tech Invoice #{order['id']}", invoice_lines(order))
+    await message.answer_document(
+        BufferedInputFile(data, filename=f"zettacode_invoice_{order['id']}.pdf"),
+        caption=f"Buyurtma #{order['id']} uchun invoice PDF.",
+    )
+
+
+def format_tasks_text(order_id: int, include_done: bool = True) -> str:
+    tasks = order_tasks(order_id, include_done=include_done)
+    if not tasks:
+        return f"Buyurtma #{order_id} uchun vazifalar yo'q."
+    lines = [f"Buyurtma #{order_id} vazifalari:"]
+    for task in tasks:
+        status = "bajarildi" if task["done"] else "kutilmoqda"
+        lines.append(
+            f"#{task['id']} - {task['task']} ({status})"
+            + (f" | {task['assignee']}" if task["assignee"] else "")
+            + (f" | deadline: {task['deadline']}" if task["deadline"] else "")
+        )
+    return "\n".join(lines)
+
+
+async def reminder_loop(bot: Bot) -> None:
+    await asyncio.sleep(20)
+    while True:
+        try:
+            after_hours = int(os.getenv("REMINDER_AFTER_HOURS", str(DEFAULT_REMINDER_AFTER_HOURS)))
+        except ValueError:
+            after_hours = DEFAULT_REMINDER_AFTER_HOURS
+
+        for order in pending_reminder_orders(after_hours):
+            status = STATUS_LABELS.get(order["status"], order["status"])
+            try:
+                await bot.send_message(
+                    order["user_id"],
+                    f"Eslatma: buyurtmangiz #{order['id']} hali yakunlanmagan.\n"
+                    f"Holat: {status}\n"
+                    f"50% predoplata: ${order['prepayment']}\n\n"
+                    "Savol bo'lsa admin bilan bog'lanishingiz mumkin.",
+                    reply_markup=contact_inline_keyboard(),
+                )
+                update_order_metadata(order["id"], reminded_at=utc_now())
+                await notify_admins(
+                    bot,
+                    f"Eslatma yuborildi: buyurtma #{order['id']}\n"
+                    f"Mijoz: {order['full_name']} (@{order['username'] or 'username yoq'})\n"
+                    f"Holat: {status}",
+                )
+            except Exception as exc:
+                logging.warning("Reminder yuborilmadi: %s", exc)
+
+        await asyncio.sleep(3600)
+
+
+def web_admin_url() -> str:
+    host = os.getenv("WEB_ADMIN_HOST", "127.0.0.1")
+    port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
+    token = os.getenv("WEB_ADMIN_TOKEN", "").strip()
+    suffix = f"?token={token}" if token else ""
+    return f"http://{host}:{port}/{suffix}"
+
+
+def web_authorized(request: web.Request) -> bool:
+    token = os.getenv("WEB_ADMIN_TOKEN", "").strip()
+    if not token:
+        return request.remote in {"127.0.0.1", "::1", "localhost"}
+    return request.query.get("token") == token
+
+
+def web_layout(title: str, body: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{html.escape(title)}</title>"
+        "<style>body{font-family:Arial,sans-serif;margin:24px;background:#f6f7f9;color:#111}"
+        "table{border-collapse:collapse;width:100%;background:white}td,th{border:1px solid #ddd;padding:8px;text-align:left}"
+        "a{color:#0b66c3}.card{background:white;padding:16px;border:1px solid #ddd;margin:12px 0}</style>"
+        "</head><body>"
+        f"<h1>{html.escape(title)}</h1>{body}</body></html>"
+    )
+
+
+async def web_index(request: web.Request) -> web.Response:
+    if not web_authorized(request):
+        return web.Response(text="Unauthorized", status=401)
+    token_param = f"?token={html.escape(request.query.get('token', ''))}" if request.query.get("token") else ""
+    rows = latest_orders(limit=50)
+    stats = html.escape(format_stats_text()).replace("\n", "<br>")
+    table_rows = []
+    for order in rows:
+        table_rows.append(
+            "<tr>"
+            f"<td><a href='/order/{order['id']}{token_param}'>#{order['id']}</a></td>"
+            f"<td>{html.escape(order['full_name'])}</td>"
+            f"<td>{html.escape(STATUS_LABELS.get(order['status'], order['status']))}</td>"
+            f"<td>{html.escape(PIPELINE_STAGES.get(order['pipeline_stage'], order['pipeline_stage']))}</td>"
+            f"<td>${order['estimate']}</td>"
+            f"<td>{html.escape(order['lead_score'] or '-')}</td>"
+            "</tr>"
+        )
+    body = (
+        f"<div class='card'>{stats}</div>"
+        "<table><thead><tr><th>ID</th><th>Mijoz</th><th>Status</th><th>Pipeline</th><th>Narx</th><th>Lead</th></tr></thead>"
+        f"<tbody>{''.join(table_rows)}</tbody></table>"
+    )
+    return web.Response(text=web_layout("ZettaCode Admin", body), content_type="text/html")
+
+
+async def web_order_detail(request: web.Request) -> web.Response:
+    if not web_authorized(request):
+        return web.Response(text="Unauthorized", status=401)
+    try:
+        order_id = int(request.match_info["order_id"])
+    except ValueError:
+        return web.Response(text="Bad order id", status=400)
+    order = get_order(order_id)
+    if order is None:
+        return web.Response(text="Order not found", status=404)
+    detail = html.escape(format_order_detail(order)).replace("\n", "<br>")
+    body = f"<div class='card'>{detail}</div><p><a href='/'>Orqaga</a></p>"
+    return web.Response(text=web_layout(f"Buyurtma #{order_id}", body), content_type="text/html")
+
+
+async def start_web_admin() -> web.AppRunner | None:
+    if os.getenv("WEB_ADMIN_ENABLED", "1").strip() in {"0", "false", "False", "yoq"}:
+        return None
+    app = web.Application()
+    app.router.add_get("/", web_index)
+    app.router.add_get("/order/{order_id}", web_order_detail)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    host = os.getenv("WEB_ADMIN_HOST", "127.0.0.1")
+    port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    logging.info("Web admin panel: %s", web_admin_url())
+    return runner
+
+
 async def ask_for_more_requirements(message: Message, session: UserSession, text: str | None = None) -> None:
     session.stage = "collect_requirements"
     await message.answer(
@@ -1986,7 +2455,7 @@ async def ask_for_more_requirements(message: Message, session: UserSession, text
         )
 
 
-async def finalize_estimate(message: Message, user: User, session: UserSession) -> None:
+async def finalize_estimate(message: Message, user: User, session: UserSession, bot: Bot | None = None) -> None:
     if not session.selected_projects:
         session.stage = "choose_project"
         await message.answer(
@@ -2023,10 +2492,18 @@ async def finalize_estimate(message: Message, user: User, session: UserSession) 
     session.ai_summary = result.summary
     session.ai_features = result.features
     session.ai_used = result.ai_used
+    session.estimated_duration = estimate_duration_label(session, original_estimate)
+    session.lead_score = lead_score_label(session, session.estimate)
     if session.order_id is None:
         session.order_id = create_order(user, session)
     else:
         update_order_price(session.order_id, session.estimate, session.prepayment)
+        update_order_metadata(
+            session.order_id,
+            pipeline_stage="priced",
+            lead_score=session.lead_score,
+            estimated_duration=session.estimated_duration,
+        )
     session.stage = "payment_confirmation"
 
     ai_label = "AI tahlil" if session.ai_used else "Tahlil"
@@ -2039,6 +2516,8 @@ async def finalize_estimate(message: Message, user: User, session: UserSession) 
     await message.answer(
         f"Tanlangan yo'nalish: {selected_project_titles(session)}\n"
         f"Murakkablik: {complexity_label(session, original_estimate)}\n"
+        f"Taxminiy muddat: {session.estimated_duration}\n"
+        f"Lead darajasi: {session.lead_score}\n"
         f"{ai_label}: {session.ai_summary}\n\n"
         f"Asosiy bandlar:\n{format_features(session.ai_features)}\n\n"
         f"{promo_text}"
@@ -2048,6 +2527,21 @@ async def finalize_estimate(message: Message, user: User, session: UserSession) 
         "plastik karta orqali qabul qilinadi. To'lov qilishga rozimisiz?",
         reply_markup=payment_keyboard(),
     )
+    if bot is not None and not session.is_admin_test:
+        await notify_admins(
+            bot,
+            f"Yangi narx chiqarildi: buyurtma #{session.order_id}\n"
+            f"Mijoz: {user.full_name} (@{user.username or 'username yoq'})\n"
+            f"Loyiha: {selected_project_titles(session)}\n"
+            f"Narx: ${session.estimate}, predoplata: ${session.prepayment}\n"
+            f"Muddat: {session.estimated_duration}\n"
+            f"Lead: {session.lead_score}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{session.order_id}")]
+                ]
+            ),
+        )
 
 
 async def send_payment_details(message: Message, session: UserSession) -> None:
@@ -2055,6 +2549,7 @@ async def send_payment_details(message: Message, session: UserSession) -> None:
     card_holder = os.getenv("CARD_HOLDER", "TOSHMIRZA YUSUPOV")
     session.stage = "awaiting_receipt"
     update_order_status(session.order_id, "awaiting_receipt")
+    update_order_metadata(session.order_id, pipeline_stage="prepayment")
     await message.answer(
         f"Karta raqami: {card_number}\n"
         f"Karta egasi: {card_holder}\n\n"
@@ -2077,6 +2572,8 @@ async def main() -> None:
     dp.message.middleware(security_middleware)
     dp.callback_query.middleware(security_middleware)
     await setup_bot_commands(bot)
+    web_runner = await start_web_admin()
+    reminder_task = asyncio.create_task(reminder_loop(bot))
 
     @dp.message(CommandStart())
     async def start_handler(message: Message) -> None:
@@ -2119,6 +2616,21 @@ async def main() -> None:
     @dp.message(Command("status"))
     async def status_handler(message: Message) -> None:
         await show_user_status(message)
+
+    @dp.message(Command("invoice"))
+    async def invoice_handler(message: Message) -> None:
+        args = command_args(message)
+        if is_admin_user(message.from_user.id) and args:
+            if not args.isdigit():
+                await message.answer("Invoice olish: /invoice BUYURTMA_ID")
+                return
+            order = get_order(int(args))
+        else:
+            order = latest_order_for_user(message.from_user.id)
+        if order is None:
+            await message.answer("Invoice uchun buyurtma topilmadi.")
+            return
+        await send_invoice_pdf(message, order)
 
     @dp.message(Command("faq"))
     async def faq_handler(message: Message) -> None:
@@ -2251,6 +2763,104 @@ async def main() -> None:
             return
         await message.answer("TT draft tayyorlanyapti...")
         await send_long_message(message, await technical_draft_for_order(order))
+
+    @dp.message(Command("stage"))
+    async def stage_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        args = command_args(message).split(maxsplit=1)
+        if len(args) != 2 or not args[0].isdigit() or args[1] not in PIPELINE_STAGES:
+            await message.answer("CRM bosqich: /stage BUYURTMA_ID new|requirements|priced|prepayment|in_progress|done")
+            return
+        order_id = int(args[0])
+        if get_order(order_id) is None:
+            await message.answer("Buyurtma topilmadi.")
+            return
+        update_order_metadata(order_id, pipeline_stage=args[1])
+        await message.answer(f"Buyurtma #{order_id} CRM bosqichi: {PIPELINE_STAGES[args[1]]}")
+
+    @dp.message(Command("task"))
+    async def task_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        args = command_args(message).split(maxsplit=1)
+        if len(args) != 2 or not args[0].isdigit():
+            await message.answer("Vazifa qo'shish: /task BUYURTMA_ID vazifa matni")
+            return
+        order_id = int(args[0])
+        if not add_order_task(order_id, args[1]):
+            await message.answer("Buyurtma topilmadi.")
+            return
+        await message.answer(f"Buyurtma #{order_id} uchun vazifa qo'shildi.")
+
+    @dp.message(Command("tasks"))
+    async def tasks_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        order_id_text = command_args(message)
+        if not order_id_text.isdigit():
+            await message.answer("Vazifalar: /tasks BUYURTMA_ID")
+            return
+        await message.answer(format_tasks_text(int(order_id_text), include_done=True))
+
+    @dp.message(Command("done"))
+    async def done_task_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        task_id_text = command_args(message)
+        if not task_id_text.isdigit():
+            await message.answer("Vazifani yopish: /done TASK_ID")
+            return
+        if not mark_task_done(int(task_id_text)):
+            await message.answer("Vazifa topilmadi.")
+            return
+        await message.answer(f"Vazifa #{task_id_text} bajarildi deb belgilandi.")
+
+    @dp.message(Command("deadline"))
+    async def deadline_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        args = command_args(message).split(maxsplit=1)
+        if len(args) != 2 or not args[0].isdigit():
+            await message.answer("Deadline: /deadline BUYURTMA_ID YYYY-MM-DD")
+            return
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[1]):
+            await message.answer("Deadline formati YYYY-MM-DD bo'lishi kerak.")
+            return
+        order_id = int(args[0])
+        if get_order(order_id) is None:
+            await message.answer("Buyurtma topilmadi.")
+            return
+        update_order_metadata(order_id, deadline=args[1])
+        await message.answer(f"Buyurtma #{order_id} deadline: {args[1]}")
+
+    @dp.message(Command("assign"))
+    async def assign_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        args = command_args(message).split(maxsplit=1)
+        if len(args) != 2 or not args[0].isdigit():
+            await message.answer("Mas'ul biriktirish: /assign BUYURTMA_ID ism")
+            return
+        order_id = int(args[0])
+        if get_order(order_id) is None:
+            await message.answer("Buyurtma topilmadi.")
+            return
+        update_order_metadata(order_id, assignee=args[1])
+        await message.answer(f"Buyurtma #{order_id} mas'ul: {args[1]}")
+
+    @dp.message(Command("web"))
+    async def web_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await message.answer(f"Web admin panel:\n{web_admin_url()}")
 
     @dp.message(Command("export"))
     async def export_handler(message: Message) -> None:
@@ -2442,6 +3052,20 @@ async def main() -> None:
             await callback.answer()
             return
 
+        if action == "pipeline" and len(parts) == 3:
+            stage = parts[2]
+            if stage not in PIPELINE_STAGES:
+                await callback.answer("Pipeline bosqichi noto'g'ri.", show_alert=True)
+                return
+            orders = latest_orders_by_pipeline(stage)
+            await safe_edit_or_answer(
+                callback,
+                f"{PIPELINE_STAGES[stage]} bosqichidagi buyurtmalar:" if orders else "Bu pipeline bosqichida buyurtma yo'q.",
+                reply_markup=orders_keyboard(orders),
+            )
+            await callback.answer()
+            return
+
         if action == "order" and len(parts) == 3:
             try:
                 order_id = int(parts[2])
@@ -2462,12 +3086,65 @@ async def main() -> None:
             await callback.answer()
             return
 
+        if action == "stage" and len(parts) == 4:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            stage = parts[3]
+            if stage not in PIPELINE_STAGES:
+                await callback.answer("Pipeline bosqichi noto'g'ri.", show_alert=True)
+                return
+            if get_order(order_id) is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            update_order_metadata(order_id, pipeline_stage=stage)
+            order = get_order(order_id)
+            await safe_edit_or_answer(
+                callback,
+                format_order_detail(order),
+                reply_markup=order_detail_keyboard(order),
+            )
+            await callback.answer(f"CRM bosqich: {PIPELINE_STAGES[stage]}")
+            return
+
         if action == "stats":
             await safe_edit_or_answer(
                 callback,
                 format_stats_text(),
                 reply_markup=admin_panel_keyboard(),
             )
+            await callback.answer()
+            return
+
+        if action == "invoice" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            order = get_order(order_id)
+            if order is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            await send_invoice_pdf(callback.message, order)
+            await callback.answer("Invoice yuborildi.")
+            return
+
+        if action == "task" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            if get_order(order_id) is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            session = get_session(callback.from_user.id)
+            session.stage = "admin_task"
+            session.pending_task_order_id = order_id
+            await callback.message.answer(f"Buyurtma #{order_id} uchun vazifa matnini yuboring.")
             await callback.answer()
             return
 
@@ -2593,7 +3270,7 @@ async def main() -> None:
         action = callback.data.split(":", 1)[1]
 
         if action == "estimate":
-            await finalize_estimate(callback.message, callback.from_user, session)
+            await finalize_estimate(callback.message, callback.from_user, session, bot=bot)
             await callback.answer()
             return
 
@@ -2706,8 +3383,20 @@ async def main() -> None:
 
         if action == "no":
             update_order_status(session.order_id, "admin_contact")
+            update_order_metadata(session.order_id, pipeline_stage="requirements")
             session.stage = "admin_contact"
             await callback.message.answer(admin_contact_text())
+            await notify_admins(
+                bot,
+                f"Mijoz predoplatani oldindan qilishni istamadi.\n"
+                f"Buyurtma #{session.order_id}\n"
+                f"Mijoz: {callback.from_user.full_name} (@{callback.from_user.username or 'username yoq'})",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{session.order_id}")]
+                    ]
+                ),
+            )
             await callback.answer()
             return
 
@@ -2724,6 +3413,15 @@ async def main() -> None:
                 "Talablarni qayta yozing. Loyiha nima qilishi kerakligini batafsil yuboring.",
             )
             await callback.answer("Tahrirlash rejimi ochildi.")
+            return
+
+        if action == "invoice":
+            order = get_order(session.order_id) if session.order_id is not None else None
+            if order is None:
+                await callback.answer("Invoice uchun buyurtma topilmadi.", show_alert=True)
+                return
+            await send_invoice_pdf(callback.message, order)
+            await callback.answer("Invoice yuborildi.")
             return
 
         await send_payment_details(callback.message, session)
@@ -2752,6 +3450,7 @@ async def main() -> None:
 
         if action == "paid":
             update_order_status(order_id, "paid")
+            update_order_metadata(order_id, pipeline_stage="in_progress")
             if session and session.order_id == order_id:
                 session.stage = "completed"
             await bot.send_message(
@@ -2768,6 +3467,7 @@ async def main() -> None:
 
         if action == "not_paid":
             update_order_status(order_id, "rejected")
+            update_order_metadata(order_id, pipeline_stage="priced")
             if session and session.order_id == order_id:
                 session.stage = "payment_confirmation"
             await bot.send_message(
@@ -2804,6 +3504,20 @@ async def main() -> None:
             else:
                 await message.answer(f"Buyurtma #{order_id} uchun izoh saqlandi.", reply_markup=admin_panel_keyboard())
             session.pending_note_order_id = None
+            session.stage = "choose_project"
+            return
+
+        if is_admin_user(message.from_user.id) and session.stage == "admin_task":
+            if session.pending_task_order_id is None:
+                session.stage = "choose_project"
+                await message.answer("Task qo'shish uchun buyurtma ID topilmadi.", reply_markup=admin_panel_keyboard())
+                return
+            order_id = session.pending_task_order_id
+            if not add_order_task(order_id, text):
+                await message.answer("Buyurtma topilmadi.", reply_markup=admin_panel_keyboard())
+            else:
+                await message.answer(f"Buyurtma #{order_id} uchun task saqlandi.", reply_markup=admin_panel_keyboard())
+            session.pending_task_order_id = None
             session.stage = "choose_project"
             return
 
@@ -2870,7 +3584,7 @@ async def main() -> None:
             return
 
         if text == CALCULATE_TEXT:
-            await finalize_estimate(message, message.from_user, session)
+            await finalize_estimate(message, message.from_user, session, bot=bot)
             return
 
         normalized_text = text.lower().replace("'", "").replace("`", "")
@@ -2880,8 +3594,20 @@ async def main() -> None:
                 return
             if is_prepayment_refusal(normalized_text):
                 update_order_status(session.order_id, "admin_contact")
+                update_order_metadata(session.order_id, pipeline_stage="requirements")
                 session.stage = "admin_contact"
                 await message.answer(admin_contact_text())
+                await notify_admins(
+                    bot,
+                    f"Mijoz predoplata bo'yicha admin bilan kelishmoqchi.\n"
+                    f"Buyurtma #{session.order_id}\n"
+                    f"Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'username yoq'})",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{session.order_id}")]
+                        ]
+                    ),
+                )
                 return
             await message.answer(
                 "To'lov qilishga rozimisiz?",
@@ -2938,12 +3664,17 @@ async def main() -> None:
                 return
 
             session.requirements_validated = True
-            await finalize_estimate(message, message.from_user, session)
+            await finalize_estimate(message, message.from_user, session, bot=bot)
             return
 
         await show_main_menu(message, user_id=message.from_user.id)
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        reminder_task.cancel()
+        if web_runner is not None:
+            await web_runner.cleanup()
 
 
 if __name__ == "__main__":
