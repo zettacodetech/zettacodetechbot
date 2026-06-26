@@ -1,0 +1,16 @@
+[Unit]
+Description=ZettaCode Tech Telegram Sales Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/inomjon/zettacode-sales-bot
+ExecStart=/home/inomjon/zettacode-sales-bot/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+User=inomjon
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

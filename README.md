@@ -24,11 +24,13 @@ cp .env.example .env
 ```env
 BOT_TOKEN=telegram_bot_tokeningiz
 ADMIN_CHAT_ID=admin_telegram_id
+ADMIN_CHAT_IDS=admin_telegram_id,boshqa_admin_id
 ADMIN_USERNAME=toshmirzayevinomjon
 CARD_NUMBER=karta_raqami
 CARD_HOLDER=karta_egasi
 GROQ_API_KEY=groq_api_key
 GROQ_MODEL=llama-3.1-8b-instant
+PROMO_CODES=ZETTA10:10,START5:5
 DB_PATH=orders.db
 ```
 
@@ -47,16 +49,27 @@ User commandlar:
 - `/prices` - xizmatlar narxlarini ko'rish
 - `/portfolio` - portfolio havolasi
 - `/contact` - admin bilan aloqa
+- `/status` - mijozning oxirgi buyurtma holati
+- `/faq` - ko'p beriladigan savollar
+- `/promo PROMOKOD` - promo kod kiritish
 - `/help` - yordam
 - `/cancel` - joriy buyurtmani bekor qilish
 
 Admin commandlar:
 
 - `/admin` - admin panel
-- `/orders` - oxirgi buyurtmalar
+- `/orders` - oxirgi buyurtmalar, `/orders paid` kabi status filter ham ishlaydi
 - `/stats` - buyurtmalar statistikasi
 - `/ai` - AI ulanish holati
 - `/testorder` - mijoz sifatida test buyurtma
+- `/search matn` - buyurtma ID, user ID, username yoki talab matni bo'yicha qidirish
+- `/note BUYURTMA_ID izoh` - buyurtmaga ichki admin izoh qo'shish
+- `/draft BUYURTMA_ID` - AI texnik topshiriq drafti
+- `/export` - buyurtmalarni CSV fayl qilib olish
+- `/broadcast matn` - barcha mijozlarga xabar yuborish
+- `/block USER_ID sabab` - foydalanuvchini bloklash
+- `/unblock USER_ID` - blokdan chiqarish
+- `/backup` - database backup faylini olish
 
 ## Tugmalar
 
@@ -87,11 +100,24 @@ Loyiha ichidagi to'lov cheklovi: mijoz buyurtma qilayotgan bot/sayt/ilova/CRM ic
 
 ## Admin panel
 
-Admin ID `.env` dagi `ADMIN_CHAT_ID` bilan bir xil bo'lsa, `/start` oddiy mijoz oqimini ochmaydi. Admin panelda:
+Admin ID `.env` dagi `ADMIN_CHAT_ID` yoki `ADMIN_CHAT_IDS` ichida bo'lsa, `/start` oddiy mijoz oqimini ochmaydi. Admin panelda:
 
 - oxirgi buyurtmalarni ko'rish;
+- status bo'yicha filterlash;
+- buyurtma qidirish;
+- buyurtmaga ichki izoh yozish;
 - buyurtma tafsilotini ochish;
 - to'lovni tasdiqlash yoki rad etish;
+- texnik topshiriq draftini olish;
+- CSV export va database backup olish;
+- broadcast yuborish;
+- userlarni bloklash yoki blokdan chiqarish;
 - statistikani ko'rish;
 - AI ulanish holatini tekshirish;
 - mijoz sifatida test buyurtma qilish mumkin.
+
+## Xavfsizlik va deploy
+
+- `.env`, `orders.db`, `bot.log`, `.venv` va `backups/` GitHubga chiqmaydi.
+- Bot spam xabarlarni rate-limit qiladi.
+- `zettacode-bot.service.example` fayli systemd orqali doimiy ishga tushirish namunasi sifatida qo'shilgan.
