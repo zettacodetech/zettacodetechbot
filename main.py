@@ -28,9 +28,11 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    MenuButtonWebApp,
     Message,
     ReplyKeyboardMarkup,
     User,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 
@@ -895,6 +897,34 @@ async def setup_bot_commands(bot: Bot) -> None:
             await bot.set_my_commands(admin_bot_commands(), scope=BotCommandScopeChat(chat_id=admin_id))
     except Exception as exc:
         logging.warning("Bot command menyusini sozlab bo'lmadi: %s", exc)
+
+
+def web_app_url() -> str:
+    return os.getenv("WEB_APP_URL", "https://toshmirzayev-inomjon.online/").strip()
+
+
+def web_app_button_text() -> str:
+    text = os.getenv("WEB_APP_BUTTON_TEXT", "Web App").strip()
+    return text[:20] or "Web App"
+
+
+async def setup_menu_button(bot: Bot) -> None:
+    url = web_app_url()
+    if not url.startswith("https://"):
+        logging.warning("WEB_APP_URL HTTPS bo'lishi kerak: %s", url)
+        return
+
+    try:
+        menu_button = MenuButtonWebApp(
+            text=web_app_button_text(),
+            web_app=WebAppInfo(url=url),
+        )
+        await bot.set_chat_menu_button(menu_button=menu_button)
+        for admin_id in admin_chat_ids():
+            await bot.set_chat_menu_button(chat_id=admin_id, menu_button=menu_button)
+        logging.info("Telegram Menu Web App sozlandi: %s", url)
+    except Exception as exc:
+        logging.warning("Telegram Menu Web App sozlanmadi: %s", exc)
 
 
 def is_admin_user(user_id: int) -> bool:
@@ -2572,6 +2602,7 @@ async def main() -> None:
     dp.message.middleware(security_middleware)
     dp.callback_query.middleware(security_middleware)
     await setup_bot_commands(bot)
+    await setup_menu_button(bot)
     web_runner = await start_web_admin()
     reminder_task = asyncio.create_task(reminder_loop(bot))
 

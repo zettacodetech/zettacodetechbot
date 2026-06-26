@@ -31,6 +31,8 @@ CARD_HOLDER=karta_egasi
 GROQ_API_KEY=groq_api_key
 GROQ_MODEL=llama-3.1-8b-instant
 PROMO_CODES=ZETTA10:10,START5:5
+WEB_APP_URL=https://toshmirzayev-inomjon.online/
+WEB_APP_BUTTON_TEXT=Web App
 REMINDER_AFTER_HOURS=24
 WEB_ADMIN_ENABLED=1
 WEB_ADMIN_HOST=127.0.0.1
@@ -136,6 +138,7 @@ Admin ID `.env` dagi `ADMIN_CHAT_ID` yoki `ADMIN_CHAT_IDS` ichida bo'lsa, `/star
 
 ## Qo'shimcha funksiyalar
 
+- Telegram pastki `Menu` tugmasi `WEB_APP_URL` dagi Web Appni ochadi. URL HTTPS bo'lishi shart.
 - CRM pipeline: `new`, `requirements`, `priced`, `prepayment`, `in_progress`, `done`.
 - Avtomatik eslatma: narx olgan, chek yubormagan yoki admin bilan kelishishga o'tgan mijozlarga `REMINDER_AFTER_HOURS` soatdan keyin xabar yuboriladi.
 - AI va fallback baholash: narx bilan birga taxminiy muddat va lead score chiqadi.
