@@ -31,7 +31,7 @@ CARD_HOLDER=karta_egasi
 GROQ_API_KEY=groq_api_key
 GROQ_MODEL=llama-3.1-8b-instant
 PROMO_CODES=ZETTA10:10,START5:5
-WEB_APP_URL=https://toshmirzayev-inomjon.online/
+WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/
 WEB_APP_BUTTON_TEXT=Web App
 REMINDER_AFTER_HOURS=24
 WEB_ADMIN_ENABLED=1
@@ -46,6 +46,33 @@ Keyin botni ishga tushiring:
 ```bash
 python main.py
 ```
+
+## Web server va yo'llar
+
+Bot bilan birga yengil aiohttp web server ishlaydi:
+
+- `/` — Telegram menyu tugmasidagi **Web App** (ZettaCode Tech narx kalkulyatori, `webapp/index.html`). Ochiq, token talab qilmaydi.
+- `/admin?token=...` — buyurtmalar admin paneli (token bilan himoyalangan).
+- `/admin/order/{id}?token=...` — buyurtma tafsiloti.
+
+Lokalda server `WEB_ADMIN_HOST:WEB_ADMIN_PORT` (standart `127.0.0.1:8088`) da, Railwayda esa avtomatik `0.0.0.0:$PORT` da ishlaydi.
+
+## Railwayga deploy
+
+Repo GitHubda: `https://github.com/zettacodetech/zettacodetechbot.git`. Railway `Procfile` va `railway.json` ni avtomatik o'qiydi (Nixpacks + Python).
+
+1. Railwayda **New Project → Deploy from GitHub repo** → `zettacodetechbot` ni tanlang.
+2. **Variables** bo'limiga `.env` dagi barcha o'zgaruvchilarni qo'shing (`.env` git'ga yuklanmaydi). Eng muhimi:
+   - `BOT_TOKEN`, `ADMIN_CHAT_ID`, `ADMIN_CHAT_IDS`, `GROQ_API_KEY`, `CARD_NUMBER`, `CARD_HOLDER`
+   - `WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/`
+   - `WEB_ADMIN_TOKEN=...` (kuchli token tanlang)
+   - `PORT` ni **qo'lda kiritmang** — Railway o'zi beradi.
+3. **Settings → Networking → Generate Domain** orqali `zettacodetechbot-production.up.railway.app` domeni ochiladi. `WEB_APP_URL` shu domenga mos bo'lsin.
+4. Deploy tugagach, Telegramda bot menyusidagi **Web App** tugmasi shu domendagi kalkulyatorni ochadi.
+
+> **Eslatma (ma'lumotlar bazasi):** Railway fayl tizimi vaqtinchalik — har deployda `orders.db` nolga tushadi. Doimiy saqlash uchun Railwayda **Volume** ulang (masalan `/data`) va `DB_PATH=/data/orders.db` qiling.
+
+> **Diqqat:** Bir vaqtning o'zida faqat bitta nusxa polling qilishi kerak. Railwayda ishga tushgach, lokal `python main.py` ni to'xtating (aks holda Telegram `Conflict` xatosi beradi).
 
 ## Buyruqlar
 

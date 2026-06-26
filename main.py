@@ -186,6 +186,7 @@ RATE_LIMIT_WINDOW_SECONDS = 8
 RATE_LIMIT_MAX_MESSAGES = 8
 DEFAULT_REMINDER_AFTER_HOURS = 24
 WEB_ADMIN_DEFAULT_PORT = 8088
+WEBAPP_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "index.html")
 PROMO_CODES = {
     "ZETTA10": 10,
     "START5": 5,
@@ -900,7 +901,7 @@ async def setup_bot_commands(bot: Bot) -> None:
 
 
 def web_app_url() -> str:
-    return os.getenv("WEB_APP_URL", "https://toshmirzayev-inomjon.online/").strip()
+    return os.getenv("WEB_APP_URL", "https://zettacodetechbot-production.up.railway.app/").strip()
 
 
 def web_app_button_text() -> str:
@@ -2385,7 +2386,7 @@ def web_admin_url() -> str:
     port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
     token = os.getenv("WEB_ADMIN_TOKEN", "").strip()
     suffix = f"?token={token}" if token else ""
-    return f"http://{host}:{port}/{suffix}"
+    return f"http://{host}:{port}/admin{suffix}"
 
 
 def web_authorized(request: web.Request) -> bool:
@@ -2408,6 +2409,12 @@ def web_layout(title: str, body: str) -> str:
     )
 
 
+async def web_app_page(request: web.Request) -> web.StreamResponse:
+    if os.path.exists(WEBAPP_HTML_PATH):
+        return web.FileResponse(WEBAPP_HTML_PATH)
+    return web.Response(text="Web app sahifasi topilmadi", status=404)
+
+
 async def web_index(request: web.Request) -> web.Response:
     if not web_authorized(request):
         return web.Response(text="Unauthorized", status=401)
@@ -2418,7 +2425,7 @@ async def web_index(request: web.Request) -> web.Response:
     for order in rows:
         table_rows.append(
             "<tr>"
-            f"<td><a href='/order/{order['id']}{token_param}'>#{order['id']}</a></td>"
+            f"<td><a href='/admin/order/{order['id']}{token_param}'>#{order['id']}</a></td>"
             f"<td>{html.escape(order['full_name'])}</td>"
             f"<td>{html.escape(STATUS_LABELS.get(order['status'], order['status']))}</td>"
             f"<td>{html.escape(PIPELINE_STAGES.get(order['pipeline_stage'], order['pipeline_stage']))}</td>"
@@ -2445,23 +2452,35 @@ async def web_order_detail(request: web.Request) -> web.Response:
     if order is None:
         return web.Response(text="Order not found", status=404)
     detail = html.escape(format_order_detail(order)).replace("\n", "<br>")
-    body = f"<div class='card'>{detail}</div><p><a href='/'>Orqaga</a></p>"
+    token_param = f"?token={html.escape(request.query.get('token', ''))}" if request.query.get("token") else ""
+    body = f"<div class='card'>{detail}</div><p><a href='/admin{token_param}'>Orqaga</a></p>"
     return web.Response(text=web_layout(f"Buyurtma #{order_id}", body), content_type="text/html")
 
 
 async def start_web_admin() -> web.AppRunner | None:
-    if os.getenv("WEB_ADMIN_ENABLED", "1").strip() in {"0", "false", "False", "yoq"}:
+    railway_port = os.getenv("PORT")
+    admin_enabled = os.getenv("WEB_ADMIN_ENABLED", "1").strip() not in {"0", "false", "False", "yoq"}
+    # Railway (PORT mavjud) bo'lsa web app sahifasi uchun server doim ishlaydi.
+    if not railway_port and not admin_enabled:
         return None
     app = web.Application()
-    app.router.add_get("/", web_index)
-    app.router.add_get("/order/{order_id}", web_order_detail)
+    app.router.add_get("/", web_app_page)
+    if admin_enabled:
+        app.router.add_get("/admin", web_index)
+        app.router.add_get("/admin/order/{order_id}", web_order_detail)
     runner = web.AppRunner(app)
     await runner.setup()
-    host = os.getenv("WEB_ADMIN_HOST", "127.0.0.1")
-    port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
+    if railway_port:
+        host = "0.0.0.0"
+        port = int(railway_port)
+    else:
+        host = os.getenv("WEB_ADMIN_HOST", "127.0.0.1")
+        port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
     site = web.TCPSite(runner, host, port)
     await site.start()
-    logging.info("Web admin panel: %s", web_admin_url())
+    logging.info("Web server ishga tushdi: http://%s:%s/ (web app)", host, port)
+    if admin_enabled:
+        logging.info("Web admin panel: %s", web_admin_url())
     return runner
 
 

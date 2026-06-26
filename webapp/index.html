@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="uz" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZettaCode Tech - Interaktiv Narx Kalkulyatori</title>
+    
+    <!-- Fonts and Icons -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Plus Jakarta Sans', 'sans-serif'],
+                        mono: ['Space Grotesk', 'sans-serif'],
+                    },
+                    colors: {
+                        cyber: {
+                            bg: '#060814',
+                            card: '#0D1127',
+                            border: '#1E264F',
+                            primary: '#00F0FF',
+                            secondary: '#7000FF',
+                            accent: '#FF007A',
+                            text: '#E2E8F0'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body {
+            background: radial-gradient(circle at 50% 0%, #121026 0%, #060814 80%);
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            overflow-x: hidden;
+        }
+        
+        .cyber-glow {
+            box-shadow: 0 0 25px rgba(0, 240, 255, 0.12);
+        }
+        
+        .cyber-glow-focus:focus-within {
+            box-shadow: 0 0 25px rgba(0, 240, 255, 0.3);
+            border-color: #00F0FF !important;
+        }
+
+        /* Custom scrollbar for listing */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #060814;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #1E264F;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #00F0FF;
+        }
+
+        /* Input Range Styling */
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            background: #151B3D;
+            height: 6px;
+            border-radius: 999px;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #00F0FF;
+            box-shadow: 0 0 10px #00F0FF;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+        }
+        
+        /* Smooth height transition */
+        .collapsible-module {
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+        }
+        .collapsible-module.show {
+            max-height: 150px;
+            opacity: 1;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+<body class="text-cyber-text antialiased min-h-screen flex flex-col justify-between">
+
+    <!-- Header -->
+    <header class="w-full max-w-7xl mx-auto px-4 py-6 flex items-center justify-between border-b border-cyber-border/40">
+        <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyber-primary to-cyber-secondary flex items-center justify-center shadow-lg shadow-cyber-primary/20">
+                <i class="fa-solid fa-code text-white text-lg"></i>
+            </div>
+            <div>
+                <span class="text-lg font-extrabold text-white tracking-wider block font-mono">ZettaCode <span class="text-cyber-primary">Tech</span></span>
+                <span class="text-[10px] text-gray-400 block tracking-widest uppercase">Next-Gen IT Solutions</span>
+            </div>
+        </div>
+        <div class="hidden sm:flex items-center gap-6 text-xs font-mono">
+            <a href="#" class="text-gray-400 hover:text-cyber-primary transition-all">Portfolio</a>
+            <a href="#" class="text-gray-400 hover:text-cyber-primary transition-all">Xizmatlar</a>
+            <span class="px-2.5 py-1 rounded bg-cyber-primary/10 border border-cyber-primary/20 text-cyber-primary animate-pulse">Online Konstruktor</span>
+        </div>
+    </header>
+
+    <!-- Main Content Grid -->
+    <main class="w-full max-w-7xl mx-auto px-4 py-8 flex-grow grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+        
+        <!-- Left Side: Interactive Controls (7 Columns) -->
+        <div class="lg:col-span-7 space-y-6 bg-cyber-card/60 border border-cyber-border/50 rounded-3xl p-6 sm:p-8 backdrop-blur-md cyber-glow">
+            
+            <div>
+                <span class="text-xs font-mono text-cyber-primary uppercase tracking-widest block">Qadam-baqadam</span>
+                <h1 class="text-2xl sm:text-3xl font-extrabold text-white mt-1">Loyiha Konstruktori</h1>
+                <p class="text-sm text-gray-400 mt-2">Sizga mos keladigan texnologik yechim va parametrlarni tanlang. Narx va muddat real vaqtda moslashadi.</p>
+            </div>
+
+            <!-- 1. Asosiy Loyiha Turi -->
+            <div class="space-y-3">
+                <label class="text-xs font-bold text-gray-400 uppercase tracking-widest font-mono block">1. Loyiha Turi</label>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    
+                    <!-- Telegram Bot Option -->
+                    <label id="card-bot" class="relative flex flex-col justify-between p-4 rounded-2xl border-2 border-cyber-primary bg-cyber-bg/50 cursor-pointer transition-all hover:border-cyber-primary/70 group">
+                        <input type="radio" name="projectType" value="bot" checked class="hidden" onchange="handleTypeChange()">
+                        <div class="flex items-center justify-between mb-4">
+                            <span class="w-10 h-10 rounded-xl bg-cyber-primary/10 text-cyber-primary flex items-center justify-center text-lg transition-transform group-hover:scale-110">
+                                <i class="fa-brands fa-telegram"></i>
+                            </span>
+                            <span class="text-[10px] font-mono text-cyber-primary uppercase font-bold">Tavsiya etiladi</span>
+                        </div>
+                        <div>
+                            <span class="text-sm font-extrabold text-white block">Telegram Bot</span>
+                            <span class="text-xs text-gray-400 block mt-1">Avtomatlashtirilgan aqlli botlar</span>
+                            <span class="text-base font-black text-cyber-primary block mt-4">$300 <span class="text-[10px] text-gray-500 font-normal">boshlang'ich</span></span>
+                        </div>
+                    </label>
+
+                    <!-- Web Site Option -->
+                    <label id="card-web" class="relative flex flex-col justify-between p-4 rounded-2xl border border-cyber-border bg-cyber-bg/20 cursor-pointer transition-all hover:border-cyber-primary/40 group">
+                        <input type="radio" name="projectType" value="web" class="hidden" onchange="handleTypeChange()">
+                        <div class="flex items-center justify-between mb-4">
+                            <span class="w-10 h-10 rounded-xl bg-cyber-secondary/10 text-cyber-secondary flex items-center justify-center text-lg transition-transform group-hover:scale-110">
+                                <i class="fa-solid fa-globe"></i>
+                            </span>
+                        </div>
+                        <div>
+                            <span class="text-sm font-extrabold text-white block">Web Sayt (Full)</span>
+                            <span class="text-xs text-gray-400 block mt-1">To'lovdan tashqari barcha funksiyalar</span>
+                            <span class="text-base font-black text-cyber-primary block mt-4">$600 <span class="text-[10px] text-gray-500 font-normal">boshlang'ich</span></span>
+                        </div>
+                    </label>
+
+                    <!-- Android App Option -->
+                    <label id="card-app" class="relative flex flex-col justify-between p-4 rounded-2xl border border-cyber-border bg-cyber-bg/20 cursor-pointer transition-all hover:border-cyber-primary/40 group">
+                        <input type="radio" name="projectType" value="app" class="hidden" onchange="handleTypeChange()">
+                        <div class="flex items-center justify-between mb-4">
+                            <span class="w-10 h-10 rounded-xl bg-cyber-accent/10 text-cyber-accent flex items-center justify-center text-lg transition-transform group-hover:scale-110">
+                                <i class="fa-brands fa-android"></i>
+                            </span>
+                        </div>
+                        <div>
+                            <span class="text-sm font-extrabold text-white block">Android Ilova</span>
+                            <span class="text-xs text-gray-400 block mt-1">Tezkor mahalliy mobil dastur</span>
+                            <span class="text-base font-black text-cyber-primary block mt-4">$800 <span class="text-[10px] text-gray-500 font-normal">boshlang'ich</span></span>
+                        </div>
+                    </label>
+
+                </div>
+            </div>
+
+            <!-- 2. Shartli Modullar: Telegram WebApp -->
+            <div id="webapp-module" class="collapsible-module show">
+                <label class="text-xs font-bold text-gray-400 uppercase tracking-widest font-mono block mb-2">2. Qo'shimcha Integratsiya</label>
+                <div class="p-4 rounded-2xl border border-cyber-border/60 bg-cyber-bg/40 flex items-center justify-between hover:border-cyber-primary/30 transition-all cursor-pointer" onclick="toggleWebAppCheckbox()">
+                    <div class="flex items-center gap-4">
+                        <div class="relative flex items-center">
+                            <input type="checkbox" id="chk-webapp" onchange="calculatePrice()" class="w-5 h-5 rounded border-cyber-border bg-cyber-bg text-cyber-primary focus:ring-cyber-primary focus:ring-offset-cyber-bg">
+                        </div>
+                        <div>
+                            <span class="text-sm font-bold text-white block">Telegram WebApp Moduli</span>
+                            <span class="text-xs text-gray-400">Bot ichida sayt kabi chiroyli vizual ilova ochish imkoniyati</span>
+                        </div>
+                    </div>
+                    <span class="text-sm font-extrabold text-cyber-primary shrink-0 ml-4">+$200</span>
+                </div>
+            </div>
+
+            <!-- 3. Server va Ma'lumotlar hajmi -->
+            <div class="space-y-3">
+                <div class="flex items-center justify-between">
+                    <label class="text-xs font-bold text-gray-400 uppercase tracking-widest font-mono block">3. Server va Ma'lumotlar hajmi</label>
+                    <span id="badge-server-type" class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyber-primary/10 border border-cyber-primary/20 text-cyber-primary font-bold">Kichik (15$)</span>
+                </div>
+                
+                <div class="p-4 rounded-2xl border border-cyber-border/60 bg-cyber-bg/40 space-y-4">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-3">
+                            <span class="w-9 h-9 rounded-lg bg-cyber-primary/10 text-cyber-primary flex items-center justify-center text-sm">
+                                <i class="fa-solid fa-server"></i>
+                            </span>
+                            <div>
+                                <span class="text-sm font-bold text-white block" id="server-title">Standart Server</span>
+                                <span class="text-xs text-gray-400" id="server-desc">Kam hajmdagi ma'lumotlar va kichik yuklama uchun</span>
+                            </div>
+                        </div>
+                        <div class="text-right">
+                            <span class="text-lg font-extrabold text-cyber-primary block" id="server-price-label">$15</span>
+                            <span class="text-[10px] text-gray-500 block font-mono">oylik to'lov</span>
+                        </div>
+                    </div>
+                    
+                    <!-- Dynamic range with 4 stages: 15$, 25$, 35$, 50$ -->
+                    <div class="space-y-2">
+                        <input type="range" id="slider-server" min="15" max="50" step="11.666" value="15" oninput="calculatePrice()" class="w-full">
+                        <div class="flex justify-between text-[10px] font-mono text-gray-500 px-1">
+                            <span>Kichik ($15)</span>
+                            <span>O'rta ($26)</span>
+                            <span>Katta ($38)</span>
+                            <span>Maksimal ($50)</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 4. Muddat va Kafolat -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                
+                <!-- Tayyorlash muddati (Tezroq = Pullik premium) -->
+                <div class="p-4 rounded-2xl border border-cyber-border/60 bg-cyber-bg/40 space-y-3">
+                    <div class="flex justify-between items-center">
+                        <span class="text-xs font-bold text-gray-400 uppercase tracking-widest font-mono">4. Tayyorlash muddati</span>
+                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 font-bold font-mono" id="badge-days-cost">+$0</span>
+                    </div>
+                    <div class="flex items-baseline gap-1">
+                        <span class="text-2xl font-black text-white" id="label-days">30</span>
+                        <span class="text-xs text-gray-400 font-mono">kun</span>
+                    </div>
+                    <input type="range" id="slider-days" min="5" max="30" step="5" value="30" oninput="calculatePrice()" class="w-full">
+                    <span class="text-[10px] text-gray-500 block leading-tight">Kam kun tezkorlik ustamasini qo'shadi (Har 5 kunga +$50).</span>
+                </div>
+
+                <!-- Texnik Kafolat -->
+                <div class="p-4 rounded-2xl border border-cyber-border/60 bg-cyber-bg/40 space-y-3">
+                    <div class="flex justify-between items-center">
+                        <span class="text-xs font-bold text-gray-400 uppercase tracking-widest font-mono">5. Kafolat muddati</span>
+                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-cyber-primary/10 text-cyber-primary font-bold font-mono" id="badge-warranty-cost">+$0</span>
+                    </div>
+                    <div class="flex items-baseline gap-1">
+                        <span class="text-2xl font-black text-white" id="label-warranty">3</span>
+                        <span class="text-xs text-gray-400 font-mono">oy</span>
+                    </div>
+                    <input type="range" id="slider-warranty" min="1" max="12" step="1" value="3" oninput="calculatePrice()" class="w-full">
+                    <span class="text-[10px] text-gray-500 block leading-tight">Bazaviy 3 oydan keyingi har bir oy uchun +$20 qo'shiladi.</span>
+                </div>
+
+            </div>
+
+        </div>
+
+        <!-- Right Side: Interactive Check-out & Live Mockup (5 Columns) -->
+        <div class="lg:col-span-5 space-y-6">
+            
+            <!-- Live Mockup Visual Preview -->
+            <div class="bg-cyber-card border border-cyber-border/70 rounded-3xl p-6 cyber-glow overflow-hidden relative min-h-[300px] flex flex-col justify-between">
+                <div class="absolute inset-0 bg-gradient-to-br from-cyber-primary/5 via-transparent to-cyber-secondary/5 pointer-events-none"></div>
+                
+                <div class="flex items-center justify-between mb-4 border-b border-cyber-border/40 pb-3 relative z-10">
+                    <span class="text-[10px] font-mono tracking-widest uppercase text-cyber-primary font-semibold flex items-center gap-1.5">
+                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span> Live Mockup Preview
+                    </span>
+                    <span class="text-[10px] font-mono text-gray-500" id="mockup-platform">Telegram Bot</span>
+                </div>
+
+                <!-- Dynamic Mockup Visualizer -->
+                <div class="flex-grow flex items-center justify-center py-4 relative z-10">
+                    
+                    <!-- Telegram Bot Mockup -->
+                    <div id="mock-bot-ui" class="w-full max-w-[280px] bg-[#17212B] rounded-xl border border-[#24303F] overflow-hidden shadow-2xl transition-all duration-300 transform scale-100">
+                        <div class="bg-[#24303F] px-3 py-2 flex items-center justify-between text-xs text-white">
+                            <div class="flex items-center gap-2">
+                                <span class="w-2.5 h-2.5 rounded-full bg-[#0088cc] flex items-center justify-center text-[8px] font-bold font-mono">Z</span>
+                                <span class="font-bold text-[10px] tracking-tight">ZettaCode Smart Bot</span>
+                            </div>
+                            <span class="text-gray-400 text-[9px] font-mono">online</span>
+                        </div>
+                        <div class="p-3 space-y-2 text-[10px]">
+                            <div class="bg-[#182533] text-gray-300 p-2 rounded-lg max-w-[80%] leading-relaxed">
+                                Salom! Men siz tanlagan funksiyalarga ega aqlli botman. 🤖
+                            </div>
+                            <div class="bg-[#0088cc] text-white p-2 rounded-lg max-w-[80%] ml-auto font-medium">
+                                Ishga tushirish!
+                            </div>
+                            <!-- Live Conditional WebApp button mockup -->
+                            <div id="mock-webapp-btn" class="pt-2 transition-all duration-300 hidden">
+                                <button class="w-full py-2 bg-cyber-primary hover:bg-cyber-primary/95 text-cyber-bg font-extrabold text-[9px] rounded-md flex items-center justify-center gap-1.5 transition-all shadow-md shadow-cyber-primary/20" onclick="simulateWebAppOpen()">
+                                    <i class="fa-solid fa-square-poll-horizontal"></i> Ochiq WebApp Ilovasi
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Web Site Mockup -->
+                    <div id="mock-web-ui" class="w-full max-w-[320px] bg-[#111] rounded-xl border border-[#222] overflow-hidden shadow-2xl transition-all duration-300 transform scale-95 opacity-0 hidden">
+                        <div class="bg-[#1E1E1E] px-3 py-1.5 flex items-center gap-1.5 text-[8px] text-gray-400 border-b border-[#333]">
+                            <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                            <span class="w-2 h-2 rounded-full bg-yellow-500"></span>
+                            <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                            <span class="bg-[#2d2d2d] px-4 py-0.5 rounded text-[7px] text-gray-300 ml-2 overflow-hidden truncate max-w-[150px]">zettacode.tech/loyihangiz</span>
+                        </div>
+                        <div class="p-4 space-y-2 text-center bg-[#090909]">
+                            <div class="h-2 w-12 bg-cyber-primary/20 mx-auto rounded-full"></div>
+                            <h4 class="text-[10px] font-extrabold text-white">Full-Stack Premium Sayt</h4>
+                            <p class="text-[7px] text-gray-500 leading-normal">Barcha kontent, boshqaruv paneli va foydalanuvchilar burchagi mavjud.</p>
+                            <div class="grid grid-cols-2 gap-1.5 pt-2">
+                                <span class="bg-cyber-card py-1 px-2 rounded border border-cyber-border/40 text-[6px] text-gray-400">Admin Panel ⚙️</span>
+                                <span class="bg-cyber-card py-1 px-2 rounded border border-cyber-border/40 text-[6px] text-gray-400">Tezkor Yuklanish ⚡</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Android App Mockup -->
+                    <div id="mock-app-ui" class="w-[150px] h-[220px] bg-[#000] rounded-[24px] border-[4px] border-[#333] relative overflow-hidden shadow-2xl transition-all duration-300 transform scale-95 opacity-0 hidden flex flex-col justify-between p-3">
+                        <div class="w-16 h-3 bg-[#333] absolute top-0 left-1/2 transform -translate-x-1/2 rounded-b-md z-20"></div>
+                        <div class="text-[7px] text-white font-extrabold flex items-center justify-between pt-1 font-mono">
+                            <span>16:06</span>
+                            <div class="flex items-center gap-1">
+                                <i class="fa-solid fa-signal"></i>
+                                <i class="fa-solid fa-battery-three-quarters"></i>
+                            </div>
+                        </div>
+                        <div class="my-auto space-y-2 text-center relative z-10 pt-2">
+                            <div class="w-8 h-8 rounded-full bg-cyber-accent/10 border border-cyber-accent/30 text-cyber-accent flex items-center justify-center mx-auto text-xs animate-bounce">
+                                <i class="fa-brands fa-android"></i>
+                            </div>
+                            <span class="text-[8px] font-black text-white block">ZettaApp Android</span>
+                            <span class="text-[6px] text-gray-400 block px-2 leading-snug">Tezkor va mukammal mobil integratsiya</span>
+                        </div>
+                        <div class="w-full bg-[#1A1A1A] rounded-lg py-1 text-center text-[7px] text-cyber-primary font-bold font-mono">
+                            Ishga Tushirish
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- Simulation popup container (for WebApp) -->
+                <div id="simulation-popup" class="absolute inset-x-4 bottom-4 top-12 bg-cyber-card border border-cyber-primary/30 rounded-2xl p-4 hidden z-20 flex flex-col justify-between shadow-2xl">
+                    <div class="flex items-center justify-between border-b border-cyber-border pb-2">
+                        <span class="text-xs font-bold text-white flex items-center gap-1.5">
+                            <i class="fa-solid fa-mobile-screen-button text-cyber-primary"></i> WebApp Interfeysi
+                        </span>
+                        <button onclick="closeWebAppSimulation()" class="text-gray-400 hover:text-white transition-all text-xs">
+                            <i class="fa-solid fa-circle-xmark"></i> Close
+                        </button>
+                    </div>
+                    <div class="flex-grow py-3 flex flex-col justify-center items-center text-center space-y-2">
+                        <i class="fa-solid fa-cubes text-cyber-primary text-xl animate-spin"></i>
+                        <h5 class="text-[11px] font-bold text-white">ZettaCode WebApp Demo</h5>
+                        <p class="text-[9px] text-gray-400 px-2 leading-relaxed">Telegramning ichida ochiluvchi, buyurtma berish va boshqarish imkonini beruvchi vizual sahifa.</p>
+                    </div>
+                    <button class="w-full py-1.5 bg-gradient-to-r from-cyber-primary to-cyber-secondary text-white font-bold text-[9px] rounded-lg">
+                        Demo buyurtma qilish
+                    </button>
+                </div>
+
+                <div class="border-t border-cyber-border/30 pt-3 relative z-10 flex justify-between items-center text-[10px] text-gray-400">
+                    <span>Texnik stack:</span>
+                    <span id="mockup-tech" class="font-mono text-cyber-primary font-bold">Node.js + Telegraf</span>
+                </div>
+            </div>
+
+            <!-- Bill Invoice & Estimate summary -->
+            <div class="bg-cyber-card border border-cyber-border rounded-3xl p-6 sm:p-8 space-y-6">
+                <div>
+                    <h3 class="text-sm font-bold text-white uppercase tracking-wider font-mono">Loyiha Hisob-kitobi</h3>
+                </div>
+
+                <!-- Price list -->
+                <div class="space-y-3 text-xs" id="invoice-items">
+                    <!-- Dinamik ravishda JS bilan to'ldiriladi -->
+                </div>
+
+                <!-- Monthly server info -->
+                <div class="p-3.5 rounded-2xl bg-cyber-bg/50 border border-cyber-border/40 flex items-center justify-between">
+                    <div class="flex items-center gap-2.5">
+                        <span class="text-cyber-primary text-sm"><i class="fa-solid fa-cloud-arrow-up"></i></span>
+                        <div>
+                            <span class="text-xs font-semibold text-white block">Server va Deployment:</span>
+                            <span class="text-[10px] text-gray-500">loyihani internetda ushlab turish haqi</span>
+                        </div>
+                    </div>
+                    <span class="text-sm font-extrabold text-cyber-primary font-mono shrink-0" id="final-server-fee">$15/oy</span>
+                </div>
+
+                <!-- Final Totals -->
+                <div class="border-t border-cyber-border/60 pt-5 space-y-4">
+                    <div class="flex justify-between items-end">
+                        <div>
+                            <span class="text-xs font-mono text-gray-400 block uppercase tracking-wider">Umumiy Qiymat</span>
+                            <span class="text-[10px] text-gray-500">(Bir martalik dasturlash xizmati)</span>
+                        </div>
+                        <div class="text-right">
+                            <span class="text-3xl font-extrabold text-white tracking-tight font-mono text-transparent bg-clip-text bg-gradient-to-r from-cyber-primary to-purple-400" id="total-price-tag">$0</span>
+                        </div>
+                    </div>
+
+                    <!-- CTA Button -->
+                    <button class="w-full py-3.5 px-4 bg-gradient-to-r from-cyber-primary to-cyber-secondary hover:from-cyan-400 hover:to-indigo-500 text-cyber-bg font-extrabold text-sm rounded-2xl shadow-lg shadow-cyber-primary/20 hover:shadow-cyber-primary/35 hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center gap-2" onclick="handleOrder()">
+                        <i class="fa-solid fa-paper-plane"></i> SHU BUDJETDA BUYURTMA BERISH
+                    </button>
+                    
+                    <span class="block text-[10px] text-center text-gray-500 leading-normal">
+                        * Buyurtma berilganda ZettaCode texnik arxitektori 1 soat ichida siz bilan bog'lanib, bepul maslahat o'tkazadi.
+                    </span>
+                </div>
+
+            </div>
+
+        </div>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="w-full border-t border-cyber-border/30 py-6 mt-8">
+        <div class="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-gray-500">
+            <span>&copy; 2026 ZettaCode Tech. Barcha huquqlar himoyalangan.</span>
+            <div class="flex items-center gap-4">
+                <a href="mailto:info@zettacode.tech" class="hover:text-cyber-primary transition-all">info@zettacode.tech</a>
+                <a href="tel:+998900000000" class="hover:text-cyber-primary transition-all">+998 (90) 000-00-00</a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Calculation & Interactive JS -->
+    <script>
+        function handleTypeChange() {
+            const projectTypes = document.getElementsByName('projectType');
+            let selectedType = 'bot';
+            for (const radio of projectTypes) {
+                if (radio.checked) selectedType = radio.value;
+            }
+
+            // Cards active states
+            const cardBot = document.getElementById('card-bot');
+            const cardWeb = document.getElementById('card-web');
+            const cardApp = document.getElementById('card-app');
+
+            cardBot.className = `relative flex flex-col justify-between p-4 rounded-2xl border bg-cyber-bg/20 cursor-pointer transition-all hover:border-cyber-primary/40 group ${selectedType === 'bot' ? 'border-2 border-cyber-primary bg-cyber-bg/50' : 'border-cyber-border'}`;
+            cardWeb.className = `relative flex flex-col justify-between p-4 rounded-2xl border bg-cyber-bg/20 cursor-pointer transition-all hover:border-cyber-primary/40 group ${selectedType === 'web' ? 'border-2 border-cyber-primary bg-cyber-bg/50' : 'border-cyber-border'}`;
+            cardApp.className = `relative flex flex-col justify-between p-4 rounded-2xl border bg-cyber-bg/20 cursor-pointer transition-all hover:border-cyber-primary/40 group ${selectedType === 'app' ? 'border-2 border-cyber-primary bg-cyber-bg/50' : 'border-cyber-border'}`;
+
+            // WebApp section visibility toggle
+            const webappModule = document.getElementById('webapp-module');
+            const mockWebAppBtn = document.getElementById('mock-webapp-btn');
+            
+            if (selectedType === 'bot') {
+                webappModule.classList.add('show');
+            } else {
+                webappModule.classList.remove('show');
+                document.getElementById('chk-webapp').checked = false;
+                mockWebAppBtn.classList.add('hidden');
+                closeWebAppSimulation();
+            }
+
+            // Mockup switching
+            const mockBot = document.getElementById('mock-bot-ui');
+            const mockWeb = document.getElementById('mock-web-ui');
+            const mockApp = document.getElementById('mock-app-ui');
+            const mockPlatform = document.getElementById('mockup-platform');
+            const mockTech = document.getElementById('mockup-tech');
+
+            if (selectedType === 'bot') {
+                mockBot.classList.remove('hidden', 'opacity-0');
+                mockBot.classList.add('scale-100');
+                mockWeb.classList.add('hidden', 'opacity-0');
+                mockApp.classList.add('hidden', 'opacity-0');
+                mockPlatform.innerText = "Telegram Bot";
+                mockTech.innerText = "Node.js + Telegraf";
+            } else if (selectedType === 'web') {
+                mockWeb.classList.remove('hidden', 'opacity-0');
+                mockWeb.classList.add('scale-100');
+                mockBot.classList.add('hidden', 'opacity-0');
+                mockApp.classList.add('hidden', 'opacity-0');
+                mockPlatform.innerText = "Web Sayt (To'lovsiz Full)";
+                mockTech.innerText = "React + Next.js + Tailwind";
+            } else if (selectedType === 'app') {
+                mockApp.classList.remove('hidden', 'opacity-0');
+                mockApp.classList.add('scale-100');
+                mockBot.classList.add('hidden', 'opacity-0');
+                mockWeb.classList.add('hidden', 'opacity-0');
+                mockPlatform.innerText = "Android Mobil Ilova";
+                mockTech.innerText = "Kotlin / Flutter";
+            }
+
+            calculatePrice();
+        }
+
+        function toggleWebAppCheckbox() {
+            const chk = document.getElementById('chk-webapp');
+            chk.checked = !chk.checked;
+            calculatePrice();
+        }
+
+        function simulateWebAppOpen() {
+            document.getElementById('simulation-popup').classList.remove('hidden');
+        }
+
+        function closeWebAppSimulation() {
+            document.getElementById('simulation-popup').classList.add('hidden');
+        }
+
+        // Animated Price Counter Helper
+        let currentTotalPrice = 0;
+        function animateValue(obj, start, end, duration) {
+            let startTimestamp = null;
+            const step = (timestamp) => {
+                if (!startTimestamp) startTimestamp = timestamp;
+                const progress = Math.min((timestamp - startTimestamp) / duration, 1);
+                obj.innerHTML = `$${Math.floor(progress * (end - start) + start)}`;
+                if (progress < 1) {
+                    window.requestAnimationFrame(step);
+                } else {
+                    obj.innerHTML = `$${end}`;
+                }
+            };
+            window.requestAnimationFrame(step);
+        }
+
+        function calculatePrice() {
+            // 1. Get Project Type & Base Price
+            const projectTypes = document.getElementsByName('projectType');
+            let selectedType = 'bot';
+            for (const radio of projectTypes) {
+                if (radio.checked) selectedType = radio.value;
+            }
+
+            let basePrice = 300;
+            let typeLabel = "Telegram Bot (Asosiy)";
+            if (selectedType === 'web') {
+                basePrice = 600;
+                typeLabel = "Web Sayt (To'lovsiz Full)";
+            } else if (selectedType === 'app') {
+                basePrice = 800;
+                typeLabel = "Android Ilova (Native/Flutter)";
+            }
+
+            let invoiceHtml = `
+                <div class="flex justify-between text-white font-semibold">
+                    <span>${typeLabel}</span>
+                    <span class="font-mono text-cyber-primary">$${basePrice}</span>
+                </div>
+            `;
+
+            // 2. WebApp Integration
+            let webappPrice = 0;
+            const mockWebAppBtn = document.getElementById('mock-webapp-btn');
+            if (selectedType === 'bot') {
+                const chkWebApp = document.getElementById('chk-webapp');
+                if (chkWebApp.checked) {
+                    webappPrice = 200;
+                    invoiceHtml += `
+                        <div class="flex justify-between text-gray-400">
+                            <span>+ Telegram WebApp vizual interfeys</span>
+                            <span class="font-mono text-cyan-400">+$200</span>
+                        </div>
+                    `;
+                    mockWebAppBtn.classList.remove('hidden');
+                } else {
+                    mockWebAppBtn.classList.add('hidden');
+                    closeWebAppSimulation();
+                }
+            }
+
+            // 3. Hosting / Server & Storage Calculation
+            const serverValue = parseFloat(document.getElementById('slider-server').value);
+            let serverMonthlyPrice = 15;
+            let serverTitle = "Standart Server";
+            let serverDesc = "Kam ma'lumot va kichik yuklama uchun";
+            let serverBadge = "Kichik (15$)";
+
+            if (serverValue >= 49) {
+                serverMonthlyPrice = 50;
+                serverTitle = "Katta Server & Ma'lumotlar";
+                serverDesc = "Ko'p ma'lumotlar, fayllar va o'ta katta yuklama";
+                serverBadge = "Maksimal (50$)";
+            } else if (serverValue >= 35) {
+                serverMonthlyPrice = 38;
+                serverTitle = "Biznes Server & Ma'lumotlar";
+                serverDesc = "Katta hajmdagi kontent va foydalanuvchilar oqimi";
+                serverBadge = "Katta (38$)";
+            } else if (serverValue >= 23) {
+                serverMonthlyPrice = 26;
+                serverTitle = "Optimal Server";
+                serverDesc = "O'rtacha ma'lumotlar bazasi va doimiy yuklama";
+                serverBadge = "O'rta (26$)";
+            }
+
+            document.getElementById('server-title').innerText = serverTitle;
+            document.getElementById('server-desc').innerText = serverDesc;
+            document.getElementById('server-price-label').innerText = `$${serverMonthlyPrice}`;
+            document.getElementById('badge-server-type').innerText = serverBadge;
+            document.getElementById('final-server-fee').innerText = `$${serverMonthlyPrice}/oy`;
+
+            // 4. Delivery time calculation (Rush Cost)
+            const days = parseInt(document.getElementById('slider-days').value);
+            document.getElementById('label-days').innerText = days;
+            
+            // Formula: base is 30 days. For each 5 days less, charge +$50.
+            let daysPrice = 0;
+            if (days < 30) {
+                const stepCount = (30 - days) / 5;
+                daysPrice = stepCount * 50;
+            }
+
+            const badgeDaysCost = document.getElementById('badge-days-cost');
+            if (daysPrice > 0) {
+                badgeDaysCost.innerText = `+$${daysPrice}`;
+                badgeDaysCost.className = "text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 font-bold font-mono animate-pulse";
+                invoiceHtml += `
+                    <div class="flex justify-between text-gray-400">
+                        <span>+ Tezkorlik haqi (${days} kunda tayyor)</span>
+                        <span class="font-mono text-amber-500">+$${daysPrice}</span>
+                    </div>
+                `;
+            } else {
+                badgeDaysCost.innerText = "+$0";
+                badgeDaysCost.className = "text-[10px] px-1.5 py-0.5 rounded bg-cyber-primary/10 text-cyber-primary font-bold font-mono";
+            }
+
+            // 5. Warranty calculation
+            const warranty = parseInt(document.getElementById('slider-warranty').value);
+            document.getElementById('label-warranty').innerText = warranty;
+
+            // Formula: Standard is 3 months. Any month above 3 costs +$20/month.
+            let warrantyPrice = 0;
+            if (warranty > 3) {
+                warrantyPrice = (warranty - 3) * 20;
+            }
+
+            const badgeWarrantyCost = document.getElementById('badge-warranty-cost');
+            if (warrantyPrice > 0) {
+                badgeWarrantyCost.innerText = `+$${warrantyPrice}`;
+                badgeWarrantyCost.className = "text-[10px] px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-400 font-bold font-mono";
+                invoiceHtml += `
+                    <div class="flex justify-between text-gray-400">
+                        <span>+ Qo'shimcha ${warranty - 3} oy kafolat ko'magi</span>
+                        <span class="font-mono text-purple-400">+$${warrantyPrice}</span>
+                    </div>
+                `;
+            } else {
+                badgeWarrantyCost.innerText = "+$0";
+                badgeWarrantyCost.className = "text-[10px] px-1.5 py-0.5 rounded bg-cyber-primary/10 text-cyber-primary font-bold font-mono";
+            }
+
+            // Final Calculation Sum
+            const finalTotal = basePrice + webappPrice + daysPrice + warrantyPrice;
+            document.getElementById('invoice-items').innerHTML = invoiceHtml;
+            
+            // Animate price update
+            const priceTag = document.getElementById('total-price-tag');
+            if (currentTotalPrice !== finalTotal) {
+                animateValue(priceTag, currentTotalPrice, finalTotal, 300);
+                currentTotalPrice = finalTotal;
+            } else {
+                priceTag.innerText = `$${finalTotal}`;
+            }
+        }
+
+        function handleOrder() {
+            // Visual feedback
+            const btn = document.querySelector('button[onclick="handleOrder()"]');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i> Arizangiz Jo'natilmoqda...`;
+            btn.disabled = true;
+
+            setTimeout(() => {
+                btn.className = "w-full py-3.5 px-4 bg-emerald-500 text-white font-extrabold text-sm rounded-2xl shadow-lg shadow-emerald-500/20 transition-all flex items-center justify-center gap-2";
+                btn.innerHTML = `<i class="fa-solid fa-check"></i> ARIZANGIZ QABUL QILINDI!`;
+                
+                setTimeout(() => {
+                    btn.className = "w-full py-3.5 px-4 bg-gradient-to-r from-cyber-primary to-cyber-secondary hover:from-cyan-400 hover:to-indigo-500 text-cyber-bg font-extrabold text-sm rounded-2xl shadow-lg shadow-cyber-primary/20 transition-all flex items-center justify-center gap-2";
+                    btn.innerHTML = originalText;
+                    btn.disabled = false;
+                }, 3000);
+            }, 1500);
+        }
+
+        // Initialize state
+        window.onload = function() {
+            handleTypeChange();
+        }
+    </script>
+</body>
+</html>
