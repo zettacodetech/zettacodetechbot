@@ -2478,9 +2478,17 @@ async def start_web_admin() -> web.AppRunner | None:
         port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
     site = web.TCPSite(runner, host, port)
     await site.start()
-    logging.info("Web server ishga tushdi: http://%s:%s/ (web app)", host, port)
+    # Railway public domeni mavjud bo'lsa, log'da o'sha ko'rsatiladi (localhost emas).
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if public_domain:
+        base_url = f"https://{public_domain}"
+    else:
+        base_url = f"http://{host}:{port}"
+    logging.info("Web server ishga tushdi: %s/ (web app)", base_url)
     if admin_enabled:
-        logging.info("Web admin panel: %s", web_admin_url())
+        admin_token = os.getenv("WEB_ADMIN_TOKEN", "").strip()
+        admin_suffix = f"?token={admin_token}" if admin_token else ""
+        logging.info("Web admin panel: %s/admin%s", base_url, admin_suffix)
     return runner
 
 
