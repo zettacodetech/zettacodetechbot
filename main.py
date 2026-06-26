@@ -2382,10 +2382,14 @@ async def reminder_loop(bot: Bot) -> None:
 
 
 def web_admin_url() -> str:
-    host = os.getenv("WEB_ADMIN_HOST", "127.0.0.1")
-    port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
     token = os.getenv("WEB_ADMIN_TOKEN", "").strip()
     suffix = f"?token={token}" if token else ""
+    # Railway (yoki boshqa public domen) bo'lsa, localhost emas, public URL qaytariladi.
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip() or os.getenv("PUBLIC_DOMAIN", "").strip()
+    if public_domain:
+        return f"https://{public_domain}/admin{suffix}"
+    host = os.getenv("WEB_ADMIN_HOST", "127.0.0.1")
+    port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
     return f"http://{host}:{port}/admin{suffix}"
 
 
