@@ -64,6 +64,22 @@ requirements.addEventListener("input", () => {
   document.querySelector("#characterCount").textContent = `${requirements.value.length} / 4000`;
 });
 
+document.querySelector("#calculatorTemplate").addEventListener("click", () => {
+  const template = [
+    "1. Loyiha maqsadi nima?",
+    "2. Foydalanuvchi nimalar qiladi?",
+    "3. Admin nimalar qiladi?",
+    "4. Qanday ma'lumotlar saqlanadi?",
+    "5. Bildirishnoma, SMS, API, fayl yuklash yoki boshqa integratsiya kerakmi?",
+    "6. Loyiha ichidagi naqd to'lov jarayoni qanday ishlaydi?",
+  ].join("\n");
+  requirements.value = requirements.value.trim()
+    ? `${requirements.value.trim()}\n\n${template}`
+    : template;
+  requirements.dispatchEvent(new Event("input"));
+  requirements.focus();
+});
+
 document.querySelector("#orderForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {

@@ -37,7 +37,7 @@ WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/app
 WEB_APP_BUTTON_TEXT=Web App
 WEBAPP_AUTH_MAX_AGE=86400
 WEBAPP_ALLOW_LOCAL_TEST=1
-REMINDER_AFTER_HOURS=24
+REMINDER_AFTER_HOURS=3
 DAILY_REPORT_HOUR=20
 WEB_ADMIN_ENABLED=1
 WEB_ADMIN_HOST=127.0.0.1
@@ -86,11 +86,13 @@ User commandlar:
 
 - `/start` - botni boshlash
 - `/new` - yangi buyurtma boshlash
+- `/calc` - loyiha kalkulyatorini ochish
 - `/prices` - xizmatlar narxlarini ko'rish
 - `/portfolio` - portfolio havolasi
 - `/contact` - admin bilan aloqa
 - `/status` - mijozning oxirgi buyurtma holati
 - `/invoice` - mijozning oxirgi buyurtmasi uchun invoice PDF
+- `/contract` - mijozning oxirgi buyurtmasi uchun shartnoma draft PDF
 - `/support MATN` - support ticket ochish
 - `/meeting YYYY-MM-DD HH:MM` - uchrashuv so'rash
 - `/referral` - referral kod va statistikani ko'rish
@@ -111,6 +113,8 @@ Admin commandlar:
 - `/note BUYURTMA_ID izoh` - buyurtmaga ichki admin izoh qo'shish
 - `/draft BUYURTMA_ID` - AI texnik topshiriq drafti
 - `/invoice BUYURTMA_ID` - invoice PDF olish
+- `/contract BUYURTMA_ID` - shartnoma draft PDF olish
+- `/kanban` - CRM Kanban ko'rinishini olish
 - `/stage BUYURTMA_ID BOSQICH` - CRM pipeline bosqichini o'zgartirish
 - `/task BUYURTMA_ID matn` - buyurtmaga vazifa qo'shish
 - `/tasks BUYURTMA_ID` - buyurtma vazifalarini ko'rish
@@ -191,6 +195,9 @@ Admin ID `.env` dagi `ADMIN_CHAT_ID` yoki `ADMIN_CHAT_IDS` ichida bo'lsa, `/star
 - `/aireport` savdo statistikasi asosida AI tavsiyalarini beradi.
 - Monitoring har 5 daqiqada database heartbeat yozadi va `DAILY_REPORT_HOUR` vaqtida adminlarga kunlik hisobot yuboradi.
 - CRM pipeline: `new`, `requirements`, `priced`, `prepayment`, `in_progress`, `done`.
+- Loyiha kalkulyatori: `/calc` yoki WebAppdagi shablon orqali bot mijozdan maqsad, user/admin amallari, saqlanadigan ma'lumotlar, integratsiyalar va naqd to'lov oqimini so'raydi.
+- Shartnoma generatori: `/contract` yoki admin panel tugmasi buyurtma bo'yicha dastlabki kelishuv PDFini yuboradi.
+- Admin Kanban: `/kanban`, admin inline panel va web admin panel CRM bosqichlarini Kanban ko'rinishida chiqaradi.
 - Avtomatik eslatma: narx olgan, chek yubormagan yoki admin bilan kelishishga o'tgan mijozlarga `REMINDER_AFTER_HOURS` soatdan keyin xabar yuboriladi.
 - AI va fallback baholash: narx bilan birga taxminiy muddat va lead score chiqadi.
 - PDF invoice: admin yoki mijoz buyurtma bo'yicha PDF invoice olishi mumkin.

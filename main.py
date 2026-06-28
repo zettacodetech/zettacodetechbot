@@ -186,9 +186,10 @@ PRICE_TEXT = "Narxlar"
 ADMIN_PANEL_TEXT = "Admin panel"
 CANCEL_TEXT = "Bekor qilish"
 CALCULATE_TEXT = "Narxni hisoblash"
+CALCULATOR_TEXT = "Kalkulyator"
 RATE_LIMIT_WINDOW_SECONDS = 8
 RATE_LIMIT_MAX_MESSAGES = 8
-DEFAULT_REMINDER_AFTER_HOURS = 24
+DEFAULT_REMINDER_AFTER_HOURS = 3
 WEB_ADMIN_DEFAULT_PORT = 8088
 APP_ROOT = Path(__file__).resolve().parent
 WEBAPP_ROOT = APP_ROOT / "webapp"
@@ -198,6 +199,14 @@ PROMO_CODES = {
     "ZETTA10": 10,
     "START5": 5,
 }
+CALCULATOR_QUESTIONS = [
+    "Loyiha maqsadi nima: savdo, buyurtma, CRM, portfolio yoki ichki avtomatlashtirishmi?",
+    "Foydalanuvchi nimalar qiladi? Masalan: ro'yxatdan o'tadi, katalog ko'radi, buyurtma beradi.",
+    "Admin nimalar qiladi? Masalan: buyurtmalarni ko'radi, status o'zgartiradi, hisobot oladi.",
+    "Qanday ma'lumotlar saqlanadi? Masalan: mijoz, mahsulot, buyurtma, to'lov, ombor.",
+    "Bildirishnoma, SMS, API, fayl yuklash yoki boshqa integratsiya kerakmi?",
+    "Loyiha ichidagi to'lov faqat naqd bo'ladi. Naqd to'lov jarayoni qanday ishlaydi?",
+]
 
 
 @dataclass
@@ -251,6 +260,7 @@ class UserSession:
     pending_task_order_id: int | None = None
     promo_code: str = ""
     promo_discount_percent: int = 0
+    calculator_mode: bool = False
 
 
 sessions: Dict[int, UserSession] = {}
@@ -1364,11 +1374,13 @@ def user_help_text() -> str:
         "Foydalanish uchun commandlar:\n\n"
         "/start - asosiy menyu\n"
         "/new - yangi buyurtma boshlash\n"
+        "/calc - loyiha kalkulyatorini ochish\n"
         "/prices - xizmatlar narxlarini ko'rish\n"
         "/portfolio - portfolio havolasi\n"
         "/contact - admin bilan aloqa\n"
         "/status - oxirgi buyurtma holati\n"
         "/invoice - oxirgi buyurtma invoice PDF\n"
+        "/contract - oxirgi buyurtma shartnoma PDF\n"
         "/support MATN - support murojaati\n"
         "/meeting YYYY-MM-DD HH:MM - uchrashuv so'rash\n"
         "/referral - referral kodingiz\n"
@@ -1393,6 +1405,8 @@ def admin_help_text() -> str:
         "/note ID izoh - buyurtmaga ichki izoh qo'shish\n"
         "/draft ID - texnik topshiriq drafti\n"
         "/invoice ID - invoice PDF\n"
+        "/contract ID - shartnoma PDF\n"
+        "/kanban - CRM Kanban ko'rinishi\n"
         "/stage ID BOSQICH - CRM bosqichini o'zgartirish\n"
         "/task ID matn - buyurtmaga vazifa qo'shish\n"
         "/tasks ID - vazifalar ro'yxati\n"
@@ -1416,7 +1430,7 @@ def admin_help_text() -> str:
         "/block USER_ID sabab - foydalanuvchini bloklash\n"
         "/unblock USER_ID - blokdan chiqarish\n"
         "/backup - database backup faylini olish\n\n"
-        "User commandlar ham ishlaydi: /start, /prices, /portfolio, /contact, /status, /invoice, /support, /meeting, /referral, /ref, /faq, /promo, /help, /cancel."
+        "User commandlar ham ishlaydi: /start, /new, /calc, /prices, /portfolio, /contact, /status, /invoice, /contract, /support, /meeting, /referral, /ref, /faq, /promo, /help, /cancel."
     )
 
 
@@ -1424,11 +1438,13 @@ def user_bot_commands() -> list[BotCommand]:
     return [
         BotCommand(command="start", description="Asosiy menyu"),
         BotCommand(command="new", description="Yangi buyurtma boshlash"),
+        BotCommand(command="calc", description="Loyiha kalkulyatori"),
         BotCommand(command="prices", description="Narxlarni ko'rish"),
         BotCommand(command="portfolio", description="Portfolioni ko'rish"),
         BotCommand(command="contact", description="Admin bilan aloqa"),
         BotCommand(command="status", description="Buyurtma holati"),
         BotCommand(command="invoice", description="Invoice PDF"),
+        BotCommand(command="contract", description="Shartnoma PDF"),
         BotCommand(command="support", description="Support murojaati"),
         BotCommand(command="meeting", description="Uchrashuv so'rash"),
         BotCommand(command="referral", description="Referral kod"),
@@ -1450,6 +1466,8 @@ def admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="note", description="Buyurtmaga izoh"),
         BotCommand(command="draft", description="TT draft"),
         BotCommand(command="invoice", description="Invoice PDF"),
+        BotCommand(command="contract", description="Shartnoma PDF"),
+        BotCommand(command="kanban", description="CRM Kanban"),
         BotCommand(command="stage", description="CRM bosqich"),
         BotCommand(command="task", description="Vazifa qo'shish"),
         BotCommand(command="tasks", description="Vazifalar"),
@@ -1720,6 +1738,37 @@ def lead_score_label(session: UserSession, estimate: int | None = None) -> str:
     if score >= 3:
         return "O'rta lead"
     return "Sovuq lead"
+
+
+def portfolio_category_for_project_keys(keys: Iterable[str]) -> str:
+    normalized_keys = set(ordered_project_keys(keys))
+    if any(key in normalized_keys for key in ("telegram_bot_simple", "telegram_twa", "telegram_order_bot")):
+        return "telegram"
+    if any(key in normalized_keys for key in ("website_landing", "website_corporate", "website_store")):
+        return "web"
+    if any(key in normalized_keys for key in ("crm_system", "accounting_system")):
+        return "crm"
+    if "mobile_app" in normalized_keys:
+        return "mobile"
+    return "all"
+
+
+def portfolio_category_for_session(session: UserSession) -> str:
+    return portfolio_category_for_project_keys(session.selected_projects)
+
+
+def portfolio_category_for_order(order: sqlite3.Row) -> str:
+    return portfolio_category_for_project_keys(order["projects"].split(","))
+
+
+def calculator_prompt_for_session(session: UserSession) -> str:
+    project_hint = selected_project_titles(session) or "tanlangan loyiha"
+    questions = "\n".join(f"{index}. {question}" for index, question in enumerate(CALCULATOR_QUESTIONS, start=1))
+    return (
+        f"{project_hint} uchun loyiha kalkulyatori.\n\n"
+        "Quyidagi savollarga bitta xabarda javob yozing. Javob qancha aniq bo'lsa, narx ham shuncha aniq chiqadi:\n\n"
+        f"{questions}"
+    )
 
 
 def detect_project_keys(text: str) -> list[str]:
@@ -2300,7 +2349,10 @@ def welcome_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Buyurtma berish", callback_data="menu:start_order")],
-            [InlineKeyboardButton(text="Narxlarni ko'rish", callback_data="menu:prices")],
+            [
+                InlineKeyboardButton(text="Kalkulyator", callback_data="menu:calculator"),
+                InlineKeyboardButton(text="Narxlarni ko'rish", callback_data="menu:prices"),
+            ],
             [
                 InlineKeyboardButton(text="Buyurtma holati", callback_data="menu:status"),
                 InlineKeyboardButton(text="FAQ", callback_data="menu:faq"),
@@ -2360,8 +2412,9 @@ def requirements_keyboard(has_requirements: bool) -> InlineKeyboardMarkup:
 
 def main_reply_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(text=START_ORDER_TEXT), KeyboardButton(text=PRICE_TEXT)],
-        [KeyboardButton(text=MAIN_MENU_TEXT), KeyboardButton(text=CANCEL_TEXT)],
+        [KeyboardButton(text=START_ORDER_TEXT), KeyboardButton(text=CALCULATOR_TEXT)],
+        [KeyboardButton(text=PRICE_TEXT), KeyboardButton(text=MAIN_MENU_TEXT)],
+        [KeyboardButton(text=CANCEL_TEXT)],
     ]
     if is_admin:
         keyboard.append([KeyboardButton(text=ADMIN_PANEL_TEXT)])
@@ -2386,7 +2439,11 @@ def payment_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Yo'q", callback_data="payment:no"),
             ],
             [InlineKeyboardButton(text="Talablarni tahrirlash", callback_data="payment:edit")],
-            [InlineKeyboardButton(text="Invoice PDF", callback_data="payment:invoice")],
+            [
+                InlineKeyboardButton(text="Mos portfolio", callback_data="payment:portfolio"),
+                InlineKeyboardButton(text="Invoice PDF", callback_data="payment:invoice"),
+            ],
+            [InlineKeyboardButton(text="Shartnoma PDF", callback_data="payment:contract")],
         ]
     )
 
@@ -2414,6 +2471,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Buyurtmalar", callback_data="panel:orders")],
+            [InlineKeyboardButton(text="Kanban", callback_data="panel:kanban")],
             [
                 InlineKeyboardButton(text="Kutilayotgan", callback_data="panel:orders:payment_confirmation"),
                 InlineKeyboardButton(text="Chek kutilmoqda", callback_data="panel:orders:awaiting_receipt"),
@@ -2508,7 +2566,13 @@ def order_detail_keyboard(order: sqlite3.Row) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(text="Invoice PDF", callback_data=f"panel:invoice:{order['id']}"),
+            InlineKeyboardButton(text="Shartnoma PDF", callback_data=f"panel:contract:{order['id']}"),
+        ]
+    )
+    rows.append(
+        [
             InlineKeyboardButton(text="Task qo'shish", callback_data=f"panel:task:{order['id']}"),
+            InlineKeyboardButton(text="Mos portfolio", callback_data=f"panel:portfolio:{order['id']}"),
         ]
     )
     rows.append(
@@ -2677,12 +2741,16 @@ async def show_project_menu(
     user_id: int,
     reset: bool = False,
     is_admin_test: bool = False,
+    calculator_mode: bool = False,
 ) -> None:
     session = reset_session(user_id, is_admin_test=is_admin_test) if reset else get_session(user_id)
+    if calculator_mode:
+        session.calculator_mode = True
     session.stage = "choose_project"
     title = "Test buyurtma rejimi.\n\n" if session.is_admin_test else ""
+    mode_text = "Loyiha kalkulyatori.\n\n" if session.calculator_mode else ""
     await message.answer(
-        f"{title}Assalomu alaykum! ZettaCode Tech'ga xush kelibsiz.\n\n"
+        f"{title}{mode_text}Assalomu alaykum! ZettaCode Tech'ga xush kelibsiz.\n\n"
         "Loyihangiz qaysi yo'nalishda bo'ladi? Bir yoki bir nechtasini tanlashingiz mumkin:",
         reply_markup=project_keyboard(session.selected_projects),
     )
@@ -2769,6 +2837,24 @@ def format_stats_text() -> str:
             f"- {PIPELINE_STAGES.get(row['pipeline_stage'], row['pipeline_stage'])}: {row['count']}"
             for row in pipelines
         )
+    return "\n".join(lines)
+
+
+def format_kanban_text(limit_per_stage: int = 6) -> str:
+    lines = ["CRM Kanban:"]
+    for stage, title in PIPELINE_STAGES.items():
+        orders = latest_orders_by_pipeline(stage, limit=limit_per_stage)
+        lines.append("")
+        lines.append(f"{title}:")
+        if not orders:
+            lines.append("- buyurtma yo'q")
+            continue
+        for order in orders:
+            username = f"@{order['username']}" if order["username"] else "username yo'q"
+            lines.append(
+                f"- #{order['id']} | ${order['estimate']} | {order['lead_score'] or '-'} | "
+                f"{order['full_name']} ({username})"
+            )
     return "\n".join(lines)
 
 
@@ -3058,6 +3144,47 @@ async def send_invoice_pdf(message: Message, order: sqlite3.Row) -> None:
     await message.answer_document(
         BufferedInputFile(data, filename=f"zettacode_invoice_{order['id']}.pdf"),
         caption=f"Buyurtma #{order['id']} uchun invoice PDF.",
+    )
+
+
+def contract_lines(order: sqlite3.Row) -> list[str]:
+    features = json.loads(order["ai_features"] or "[]")
+    feature_lines = features[:8] if features else ["Asosiy funksiyalar texnik topshiriq bosqichida aniqlashtiriladi"]
+    return [
+        f"Kelishuv loyihasi: ZettaCode Tech buyurtma #{order['id']}",
+        f"Sana: {datetime.now().strftime('%Y-%m-%d')}",
+        "",
+        "Tomonlar:",
+        "Ijrochi: ZettaCode Tech",
+        f"Mijoz: {order['full_name']} (@{order['username'] or 'username yoq'})",
+        "",
+        "Loyiha:",
+        f"Turi: {projects_from_order(order)}",
+        f"Murakkablik: {complexity_label_for_order(order)}",
+        f"Taxminiy muddat: {order['estimated_duration'] or '-'}",
+        "",
+        "Asosiy ishlar:",
+        *[f"- {line}" for line in feature_lines],
+        "",
+        "Narx va tolov:",
+        f"Umumiy taxminiy narx: ${order['estimate']}",
+        f"Ish boshlash uchun 50% predoplata: ${order['prepayment']}",
+        "Predoplata plastik karta orqali qabul qilinadi.",
+        "Loyiha ichidagi tolov funksiyasi faqat naqd tolov sifatida korib chiqiladi.",
+        "",
+        "Izoh:",
+        "Ushbu hujjat dastlabki kelishuv drafti. Yakuniy shartlar admin bilan tasdiqlanadi.",
+        "",
+        "Talablar:",
+        *(order["requirements"].splitlines()[:12] or ["-"]),
+    ]
+
+
+async def send_contract_pdf(message: Message, order: sqlite3.Row) -> None:
+    data = simple_pdf_bytes(f"ZettaCode Tech Contract #{order['id']}", contract_lines(order))
+    await message.answer_document(
+        BufferedInputFile(data, filename=f"zettacode_contract_{order['id']}.pdf"),
+        caption=f"Buyurtma #{order['id']} uchun shartnoma draft PDF.",
     )
 
 
@@ -3416,7 +3543,10 @@ def web_layout(title: str, body: str) -> str:
         f"<title>{html.escape(title)}</title>"
         "<style>body{font-family:Arial,sans-serif;margin:24px;background:#f6f7f9;color:#111}"
         "table{border-collapse:collapse;width:100%;background:white}td,th{border:1px solid #ddd;padding:8px;text-align:left}"
-        "a{color:#0b66c3}.card{background:white;padding:16px;border:1px solid #ddd;margin:12px 0}</style>"
+        "a{color:#0b66c3}.card{background:white;padding:16px;border:1px solid #ddd;margin:12px 0}"
+        ".kanban{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:12px 0}"
+        ".lane{background:white;border:1px solid #ddd;padding:10px}.lane h2{font-size:15px;margin:0 0 8px}"
+        ".deal{display:block;border-top:1px solid #eee;padding:8px 0;font-size:13px}</style>"
         "</head><body>"
         f"<h1>{html.escape(title)}</h1>{body}</body></html>"
     )
@@ -3444,6 +3574,22 @@ async def web_index(request: web.Request) -> web.Response:
     token_param = f"?token={html.escape(request.query.get('token', ''))}" if request.query.get("token") else ""
     rows = latest_orders(limit=50)
     stats = html.escape(format_stats_text()).replace("\n", "<br>")
+    kanban_columns = []
+    for stage, title in PIPELINE_STAGES.items():
+        cards = []
+        for order in latest_orders_by_pipeline(stage, limit=5):
+            cards.append(
+                "<a class='deal' "
+                f"href='/admin/order/{order['id']}{token_param}'>"
+                f"#{order['id']} - {html.escape(order['full_name'])}<br>"
+                f"${order['estimate']} - {html.escape(order['lead_score'] or '-')}"
+                "</a>"
+            )
+        if not cards:
+            cards.append("<span class='deal'>buyurtma yo'q</span>")
+        kanban_columns.append(
+            f"<section class='lane'><h2>{html.escape(title)}</h2>{''.join(cards)}</section>"
+        )
     table_rows = []
     for order in rows:
         table_rows.append(
@@ -3458,6 +3604,7 @@ async def web_index(request: web.Request) -> web.Response:
         )
     body = (
         f"<div class='card'>{stats}</div>"
+        f"<div class='kanban'>{''.join(kanban_columns)}</div>"
         "<table><thead><tr><th>ID</th><th>Mijoz</th><th>Status</th><th>Pipeline</th><th>Narx</th><th>Lead</th></tr></thead>"
         f"<tbody>{''.join(table_rows)}</tbody></table>"
     )
@@ -3749,6 +3896,22 @@ async def main() -> None:
             return
         await show_project_menu(message, user_id=message.from_user.id, reset=True)
 
+    @dp.message(Command("calc"))
+    async def calculator_handler(message: Message) -> None:
+        if is_admin_user(message.from_user.id):
+            await message.answer(
+                "Siz adminsiz. Kalkulyatorni mijoz sifatida sinash uchun admin paneldagi "
+                "`Mijoz sifatida test` tugmasidan foydalaning.",
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+        await show_project_menu(
+            message,
+            user_id=message.from_user.id,
+            reset=True,
+            calculator_mode=True,
+        )
+
     @dp.message(Command("prices"))
     async def prices_handler(message: Message) -> None:
         await show_prices(message)
@@ -3779,6 +3942,21 @@ async def main() -> None:
             await message.answer("Invoice uchun buyurtma topilmadi.")
             return
         await send_invoice_pdf(message, order)
+
+    @dp.message(Command("contract"))
+    async def contract_handler(message: Message) -> None:
+        args = command_args(message)
+        if is_admin_user(message.from_user.id) and args:
+            if not args.isdigit():
+                await message.answer("Shartnoma olish: /contract BUYURTMA_ID")
+                return
+            order = get_order(int(args))
+        else:
+            order = latest_order_for_user(message.from_user.id)
+        if order is None:
+            await message.answer("Shartnoma uchun buyurtma topilmadi.")
+            return
+        await send_contract_pdf(message, order)
 
     @dp.message(Command("support"))
     async def support_handler(message: Message) -> None:
@@ -3909,6 +4087,13 @@ async def main() -> None:
             await message.answer("Bu command faqat admin uchun.")
             return
         await message.answer(format_stats_text(), reply_markup=admin_panel_keyboard())
+
+    @dp.message(Command("kanban"))
+    async def kanban_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await send_long_message(message, format_kanban_text())
 
     @dp.message(Command("ai"))
     async def ai_handler(message: Message) -> None:
@@ -4330,6 +4515,24 @@ async def main() -> None:
             await callback.answer()
             return
 
+        if action == "calculator":
+            if is_admin_user(callback.from_user.id):
+                await callback.message.answer(
+                    "Siz adminsiz. Kalkulyatorni mijoz sifatida sinash uchun admin paneldagi "
+                    "`Mijoz sifatida test` tugmasidan foydalaning.",
+                    reply_markup=admin_panel_keyboard(),
+                )
+                await callback.answer()
+                return
+            await show_project_menu(
+                callback.message,
+                user_id=callback.from_user.id,
+                reset=True,
+                calculator_mode=True,
+            )
+            await callback.answer()
+            return
+
         if action == "prices":
             await show_prices(callback.message)
             await callback.answer()
@@ -4382,11 +4585,14 @@ async def main() -> None:
             callback.from_user.id,
             is_admin_test=is_admin_user(callback.from_user.id),
         )
+        session.calculator_mode = current_session.calculator_mode
         session.selected_projects.add(project_key)
         await ask_for_more_requirements(
             callback.message,
             session,
-            f"{PROJECT_PRICES[project_key][0]} tanlandi. Endi loyiha nima vazifalarni bajarishini batafsil yozing.",
+            calculator_prompt_for_session(session)
+            if session.calculator_mode
+            else f"{PROJECT_PRICES[project_key][0]} tanlandi. Endi loyiha nima vazifalarni bajarishini batafsil yozing.",
         )
         await callback.answer()
 
@@ -4438,6 +4644,15 @@ async def main() -> None:
                     title,
                     reply_markup=orders_keyboard(orders),
                 )
+            await callback.answer()
+            return
+
+        if action == "kanban":
+            await safe_edit_or_answer(
+                callback,
+                format_kanban_text(),
+                reply_markup=admin_panel_keyboard(),
+            )
             await callback.answer()
             return
 
@@ -4520,6 +4735,37 @@ async def main() -> None:
                 return
             await send_invoice_pdf(callback.message, order)
             await callback.answer("Invoice yuborildi.")
+            return
+
+        if action == "contract" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            order = get_order(order_id)
+            if order is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            await send_contract_pdf(callback.message, order)
+            await callback.answer("Shartnoma yuborildi.")
+            return
+
+        if action == "portfolio" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            order = get_order(order_id)
+            if order is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            await callback.message.answer(
+                portfolio_text(portfolio_category_for_order(order)),
+                reply_markup=portfolio_keyboard(),
+            )
+            await callback.answer("Mos portfolio yuborildi.")
             return
 
         if action == "task" and len(parts) == 3:
@@ -4637,7 +4883,9 @@ async def main() -> None:
             await ask_for_more_requirements(
                 callback.message,
                 session,
-                "Loyihangiz to'liq qanday ishlashi va nima vazifalarni bajarishi kerakligini batafsil yozib bering.",
+                calculator_prompt_for_session(session)
+                if session.calculator_mode
+                else "Loyihangiz to'liq qanday ishlashi va nima vazifalarni bajarishi kerakligini batafsil yozib bering.",
             )
             await callback.answer()
             return
@@ -4875,6 +5123,23 @@ async def main() -> None:
             await callback.answer("Invoice yuborildi.")
             return
 
+        if action == "contract":
+            order = get_order(session.order_id) if session.order_id is not None else None
+            if order is None:
+                await callback.answer("Shartnoma uchun buyurtma topilmadi.", show_alert=True)
+                return
+            await send_contract_pdf(callback.message, order)
+            await callback.answer("Shartnoma yuborildi.")
+            return
+
+        if action == "portfolio":
+            await callback.message.answer(
+                portfolio_text(portfolio_category_for_session(session)),
+                reply_markup=portfolio_keyboard(),
+            )
+            await callback.answer("Mos portfolio yuborildi.")
+            return
+
         await send_payment_details(callback.message, session)
         await callback.answer()
 
@@ -5028,6 +5293,22 @@ async def main() -> None:
 
         if text == PRICE_TEXT:
             await show_prices(message)
+            return
+
+        if text == CALCULATOR_TEXT:
+            if is_admin_user(message.from_user.id) and not session.is_admin_test:
+                await message.answer(
+                    "Siz adminsiz. Kalkulyatorni mijoz sifatida sinash uchun admin paneldagi "
+                    "`Mijoz sifatida test` tugmasidan foydalaning.",
+                    reply_markup=admin_panel_keyboard(),
+                )
+                return
+            await show_project_menu(
+                message,
+                user_id=message.from_user.id,
+                reset=True,
+                calculator_mode=True,
+            )
             return
 
         if text == CANCEL_TEXT:
