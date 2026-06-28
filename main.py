@@ -4423,15 +4423,28 @@ async def web_healthz(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "detail": str(exc)}, status=503)
 
 
-async def start_web_admin(bot: Bot) -> web.AppRunner | None:
+async def start_web_admin(
+    bot: Bot,
+    dp: Dispatcher | None = None,
+    webhook_path: str | None = None,
+    webhook_secret: str | None = None,
+) -> web.AppRunner | None:
     railway_port = os.getenv("PORT")
     admin_enabled = os.getenv("WEB_ADMIN_ENABLED", "1").strip() not in {"0", "false", "False", "yoq"}
-    # Railway (PORT mavjud) bo'lsa web app sahifasi uchun server doim ishlaydi.
-    if not railway_port and not admin_enabled:
+    # Webhook rejimida web server doim kerak (Telegram update'larini qabul qiladi).
+    if not railway_port and not admin_enabled and not webhook_path:
         return None
     app = web.Application()
     app["bot"] = bot
     app.router.add_get("/healthz", web_healthz)
+    # Webhook rejimi yoqilgan bo'lsa, Telegram update handler'ini ro'yxatdan o'tkazamiz.
+    if webhook_path and dp is not None:
+        from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+
+        SimpleRequestHandler(
+            dispatcher=dp, bot=bot, secret_token=webhook_secret
+        ).register(app, path=webhook_path)
+        logging.info("Webhook handler ro'yxatdan o'tdi: %s", webhook_path)
     app.router.add_get("/", web_app_page)
     app.router.add_get("/app", web_app_page)
     app.router.add_get("/app/{filename}", webapp_static)
@@ -4671,6 +4684,15 @@ async def main() -> None:
     bot = Bot(token=bot_token)
     dp = Dispatcher()
 
+    # Webhook konfiguratsiyasi (ixtiyoriy — default polling).
+    use_webhook = os.getenv("USE_WEBHOOK", "0").strip() in {"1", "true", "True", "ha"}
+    webhook_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip() or os.getenv("PUBLIC_DOMAIN", "").strip()
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or hashlib.sha256(bot_token.encode()).hexdigest()[:40]
+    webhook_active = bool(use_webhook and webhook_domain)
+    webhook_path = f"/webhook/{webhook_secret}"
+    if use_webhook and not webhook_domain:
+        logging.warning("USE_WEBHOOK=1, lekin public domen yo'q — polling rejimida ishlaymiz")
+
     @dp.errors()
     async def on_error(event: Any) -> bool:
         exc = getattr(event, "exception", None)
@@ -4685,7 +4707,12 @@ async def main() -> None:
     dp.callback_query.middleware(security_middleware)
     await setup_bot_commands(bot)
     await setup_menu_button(bot)
-    web_runner = await start_web_admin(bot)
+    web_runner = await start_web_admin(
+        bot,
+        dp=dp if webhook_active else None,
+        webhook_path=webhook_path if webhook_active else None,
+        webhook_secret=webhook_secret if webhook_active else None,
+    )
     reminder_task = asyncio.create_task(reminder_loop(bot))
     monitor_task = asyncio.create_task(monitoring_loop(bot))
     await notify_admins(bot, "ZettaCode Tech bot ishga tushdi.\n\n" + health_text())
@@ -6606,7 +6633,28 @@ async def main() -> None:
         await show_main_menu(message, user_id=message.from_user.id)
 
     try:
-        await dp.start_polling(bot)
+        started_webhook = False
+        if webhook_active:
+            try:
+                webhook_url = f"https://{webhook_domain}{webhook_path}"
+                await bot.set_webhook(
+                    webhook_url,
+                    secret_token=webhook_secret,
+                    drop_pending_updates=False,
+                )
+                logging.info("Webhook rejimida ishlamoqda: %s", webhook_url)
+                started_webhook = True
+                await asyncio.Event().wait()  # web server update'larni qabul qiladi
+            except Exception as exc:  # noqa: BLE001
+                logging.error("Webhook o'rnatilmadi, polling'ga qaytamiz: %s", exc)
+                started_webhook = False
+        if not started_webhook:
+            # Polling rejimi (default) — avval webhook bo'lsa o'chiramiz (konflikt bo'lmasin).
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:  # noqa: BLE001
+                pass
+            await dp.start_polling(bot)
     finally:
         reminder_task.cancel()
         monitor_task.cancel()
