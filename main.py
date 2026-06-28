@@ -357,6 +357,119 @@ def db_path() -> str:
     return os.getenv("DB_PATH", "orders.db")
 
 
+# ============================ i18n (UZ/RU/EN) ============================
+SUPPORTED_LANGUAGES = {"uz": "O'zbekcha 🇺🇿", "ru": "Русский 🇷🇺", "en": "English 🇬🇧"}
+DEFAULT_LANGUAGE = "uz"
+_lang_cache: dict[int, str] = {}
+
+TRANSLATIONS: dict[str, dict[str, str]] = {
+    "choose_language": {
+        "uz": "Tilni tanlang:",
+        "ru": "Выберите язык:",
+        "en": "Choose your language:",
+    },
+    "language_set": {
+        "uz": "✅ Til o'zbek tiliga o'rnatildi.",
+        "ru": "✅ Язык установлен на русский.",
+        "en": "✅ Language set to English.",
+    },
+    "welcome": {
+        "uz": (
+            "Assalomu alaykum! ZettaCode Tech savdo botiga xush kelibsiz.\n\n"
+            "Biz Telegram bot, veb-sayt, mobil ilova va CRM tizimlarini ishlab chiqamiz. "
+            "Loyihangiz uchun taxminiy narx olish uchun «Buyurtma berish» tugmasini bosing."
+        ),
+        "ru": (
+            "Здравствуйте! Добро пожаловать в бот ZettaCode Tech.\n\n"
+            "Мы разрабатываем Telegram-боты, веб-сайты, мобильные приложения и CRM-системы. "
+            "Чтобы получить примерную стоимость проекта, нажмите «Заказать»."
+        ),
+        "en": (
+            "Hello! Welcome to the ZettaCode Tech bot.\n\n"
+            "We build Telegram bots, websites, mobile apps and CRM systems. "
+            "Press «Order» to get an estimate for your project."
+        ),
+    },
+    "choose_action": {
+        "uz": "Qaysi amalni bajaramiz?",
+        "ru": "Что хотите сделать?",
+        "en": "What would you like to do?",
+    },
+    "btn_order": {"uz": "Buyurtma berish", "ru": "Заказать", "en": "Order"},
+    "btn_prices": {"uz": "Narxlar", "ru": "Цены", "en": "Prices"},
+    "btn_portfolio": {"uz": "Portfolio", "ru": "Портфолио", "en": "Portfolio"},
+    "btn_contact": {"uz": "Admin bilan aloqa", "ru": "Связь с админом", "en": "Contact admin"},
+    "help": {
+        "uz": "Buyruqlar: /start /new /prices /portfolio /contact /status /language /help",
+        "ru": "Команды: /start /new /prices /portfolio /contact /status /language /help",
+        "en": "Commands: /start /new /prices /portfolio /contact /status /language /help",
+    },
+}
+
+
+def t(key: str, lang: str = DEFAULT_LANGUAGE, **kwargs: Any) -> str:
+    """Tarjima qaytaradi. Topilmasa: tanlangan til → o'zbekcha → kalitning o'zi (hech qachon xato bermaydi)."""
+    entry = TRANSLATIONS.get(key, {})
+    text = entry.get(lang) or entry.get(DEFAULT_LANGUAGE) or key
+    if kwargs:
+        try:
+            text = text.format(**kwargs)
+        except Exception:  # noqa: BLE001
+            pass
+    return text
+
+
+def get_user_language(user_id: int) -> str:
+    if user_id in _lang_cache:
+        return _lang_cache[user_id]
+    lang = DEFAULT_LANGUAGE
+    try:
+        with db_connect() as connection:
+            row = connection.execute(
+                "SELECT language FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        if row and row["language"] in SUPPORTED_LANGUAGES:
+            lang = row["language"]
+    except Exception:  # noqa: BLE001
+        pass
+    _lang_cache[user_id] = lang
+    return lang
+
+
+def is_language_chosen(user_id: int) -> bool:
+    """Foydalanuvchi tilni tanlaganmi. Xato bo'lsa True (oqimni to'smaymiz)."""
+    try:
+        with db_connect() as connection:
+            row = connection.execute(
+                "SELECT language FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return bool(row and row["language"] in SUPPORTED_LANGUAGES)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def set_user_language(user_id: int, lang: str) -> None:
+    if lang not in SUPPORTED_LANGUAGES:
+        return
+    try:
+        with db_connect() as connection:
+            connection.execute(
+                "UPDATE users SET language = ? WHERE user_id = ?", (lang, user_id)
+            )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Til saqlanmadi: %s", exc)
+    _lang_cache[user_id] = lang
+
+
+def language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=title, callback_data=f"setlang:{code}")]
+            for code, title in SUPPORTED_LANGUAGES.items()
+        ]
+    )
+
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 IS_POSTGRES = bool(DATABASE_URL)
 
@@ -498,6 +611,7 @@ def init_db() -> None:
             )
             """
         )
+        ensure_column(connection, "users", "language", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS order_tasks (
@@ -3045,13 +3159,13 @@ async def show_admin_panel(message: Message) -> None:
 
 
 async def show_main_menu(message: Message, user_id: int) -> None:
+    lang = get_user_language(user_id)
     await message.answer(
-        "ZettaCode Tech AI savdo agenti tayyor. Pastdagi tugmalardan foydalanishingiz yoki "
-        "loyihangiz haqida to'g'ridan-to'g'ri yozishingiz mumkin.",
+        t("welcome", lang),
         reply_markup=main_reply_keyboard(is_admin_user(user_id)),
     )
     await message.answer(
-        "Qaysi amalni bajaramiz?",
+        t("choose_action", lang),
         reply_markup=welcome_inline_keyboard(),
     )
 
@@ -4727,7 +4841,21 @@ async def main() -> None:
         if start_args.startswith("ref_") and apply_referral_code(message.from_user.id, start_args[4:]):
             set_session_promo(session, "START5")
             await message.answer("Referral havola qabul qilindi. 5% promo faollashdi.")
+        # Birinchi marta — til tanlash (onboarding). Tanlangach menyu ko'rsatiladi.
+        if not is_language_chosen(message.from_user.id):
+            await message.answer(
+                "🌐 " + " / ".join(t("choose_language", code) for code in SUPPORTED_LANGUAGES),
+                reply_markup=language_keyboard(),
+            )
+            return
         await show_main_menu(message, user_id=message.from_user.id)
+
+    @dp.message(Command("language"))
+    async def language_handler(message: Message) -> None:
+        await message.answer(
+            "🌐 " + " / ".join(t("choose_language", code) for code in SUPPORTED_LANGUAGES),
+            reply_markup=language_keyboard(),
+        )
 
     @dp.message(Command("admin"))
     async def admin_handler(message: Message) -> None:
@@ -5492,6 +5620,19 @@ async def main() -> None:
         unblock_user(int(user_id_text))
         log_audit(message.from_user.id, "user_unblock", "user", int(user_id_text))
         await message.answer(f"User {user_id_text} blokdan chiqarildi.")
+
+    @dp.callback_query(F.data.startswith("setlang:"))
+    async def setlang_callback(callback: CallbackQuery) -> None:
+        lang = callback.data.split(":", 1)[1]
+        set_user_language(callback.from_user.id, lang)
+        await callback.answer()
+        if callback.message:
+            try:
+                await callback.message.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await callback.message.answer(t("language_set", lang))
+            await show_main_menu(callback.message, user_id=callback.from_user.id)
 
     @dp.callback_query(F.data == "checksub")
     async def checksub_callback(callback: CallbackQuery) -> None:
