@@ -29,6 +29,7 @@ from aiogram.types import (
     BotCommandScopeDefault,
     BufferedInputFile,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -756,6 +757,61 @@ def init_db() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS managed_chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                added_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+def register_managed_chat(
+    chat_id: int, chat_type: str, title: str, username: str, status: str
+) -> None:
+    now = utc_now()
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO managed_chats (chat_id, chat_type, title, username, status, added_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                chat_type = excluded.chat_type,
+                title = excluded.title,
+                username = excluded.username,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            (chat_id, chat_type, title, username or "", status, now, now),
+        )
+
+
+def managed_chats(admin_only: bool = True) -> list:
+    with db_connect() as connection:
+        if admin_only:
+            return list(
+                connection.execute(
+                    "SELECT * FROM managed_chats WHERE status IN ('administrator', 'creator') ORDER BY updated_at DESC"
+                ).fetchall()
+            )
+        return list(
+            connection.execute(
+                "SELECT * FROM managed_chats ORDER BY updated_at DESC"
+            ).fetchall()
+        )
+
+
+def get_managed_chat(chat_id: int):
+    with db_connect() as connection:
+        return connection.execute(
+            "SELECT * FROM managed_chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
 
 
 def track_user(user: User) -> None:
@@ -2017,6 +2073,12 @@ class SecurityMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if user is None:
             return await handler(event, data)
+
+        # Bot faqat shaxsiy chatda javob beradi — guruh/kanalda jim turadi (spam bo'lmasin).
+        # Guruh/kanallar admin tomonidan DM'dagi buyruqlar orqali boshqariladi.
+        chat = getattr(event, "chat", None)
+        if isinstance(event, Message) and chat is not None and chat.type != "private":
+            return None
 
         if isinstance(event, Message):
             track_user(user)
@@ -4856,6 +4918,152 @@ async def main() -> None:
             "🌐 " + " / ".join(t("choose_language", code) for code in SUPPORTED_LANGUAGES),
             reply_markup=language_keyboard(),
         )
+
+    # ============== Kanal / guruh boshqaruvi (bot admin bo'lgan joylar) ==============
+    @dp.my_chat_member()
+    async def on_my_chat_member(event: ChatMemberUpdated) -> None:
+        chat = event.chat
+        status = event.new_chat_member.status
+        status_str = getattr(status, "value", str(status))
+        register_managed_chat(chat.id, chat.type, chat.title or "", chat.username or "", status_str)
+        if status_str in ("administrator", "creator"):
+            await notify_admins(
+                event.bot,
+                "✅ Bot yangi joyda admin bo'ldi:\n"
+                f"{chat.title or chat.id} ({chat.type}, id={chat.id})\n\n"
+                f"Post yuborish: /post {chat.id} matn",
+            )
+
+    @dp.message(Command("channels"))
+    async def channels_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        rows = managed_chats(admin_only=True)
+        if not rows:
+            await message.answer(
+                "Bot hali hech qaysi kanal/guruhda admin emas.\n\n"
+                "Botni Telegram'da kanal/guruhga admin qiling — u avtomatik shu ro'yxatga tushadi."
+            )
+            return
+        lines = ["Bot admin bo'lgan kanal/guruhlar:\n"]
+        for r in rows:
+            uname = f" @{r['username']}" if r["username"] else ""
+            lines.append(f"• {r['title'] or r['chat_id']}{uname}\n   id: {r['chat_id']} ({r['chat_type']})")
+        lines.append("\nPost: /post <id> matn\nHammasiga: /postall matn")
+        await message.answer("\n".join(lines))
+
+    @dp.message(Command("post"))
+    async def post_channel_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        parts = command_args(message).split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("Foydalanish: /post <chat_id> <matn>")
+            return
+        try:
+            chat_id = int(parts[0])
+        except ValueError:
+            await message.answer("chat_id noto'g'ri (raqam bo'lishi kerak).")
+            return
+        try:
+            await message.bot.send_message(chat_id, parts[1])
+            await message.answer("✅ Post yuborildi.")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ Yuborilmadi: {exc}")
+
+    @dp.message(Command("postall"))
+    async def postall_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        text = command_args(message).strip()
+        if not text:
+            await message.answer("Foydalanish: /postall <matn>")
+            return
+        rows = managed_chats(admin_only=True)
+        if not rows:
+            await message.answer("Bot hech qaysi kanal/guruhda admin emas.")
+            return
+        sent = failed = 0
+        for r in rows:
+            try:
+                await message.bot.send_message(r["chat_id"], text)
+                sent += 1
+            except Exception:  # noqa: BLE001
+                failed += 1
+            await asyncio.sleep(0.05)
+        await message.answer(f"Broadcast yakunlandi.\nYuborildi: {sent}\nXato: {failed}")
+
+    @dp.message(Command("kick"))
+    async def kick_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        parts = command_args(message).split()
+        if len(parts) < 2:
+            await message.answer("Foydalanish: /kick <chat_id> <user_id>")
+            return
+        try:
+            chat_id, target = int(parts[0]), int(parts[1])
+            await message.bot.ban_chat_member(chat_id, target)
+            await message.bot.unban_chat_member(chat_id, target)  # ban+unban = chiqarish
+            await message.answer("✅ Foydalanuvchi chiqarildi.")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ {exc}")
+
+    @dp.message(Command("ban"))
+    async def ban_chat_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        parts = command_args(message).split()
+        if len(parts) < 2:
+            await message.answer("Foydalanish: /ban <chat_id> <user_id>")
+            return
+        try:
+            await message.bot.ban_chat_member(int(parts[0]), int(parts[1]))
+            await message.answer("✅ Foydalanuvchi bloklandi (ban).")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ {exc}")
+
+    @dp.message(Command("unban"))
+    async def unban_chat_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        parts = command_args(message).split()
+        if len(parts) < 2:
+            await message.answer("Foydalanish: /unban <chat_id> <user_id>")
+            return
+        try:
+            await message.bot.unban_chat_member(int(parts[0]), int(parts[1]))
+            await message.answer("✅ Blokdan chiqarildi.")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ {exc}")
+
+    @dp.message(Command("cpin"))
+    async def cpin_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        parts = command_args(message).split()
+        if len(parts) < 2:
+            await message.answer("Foydalanish: /cpin <chat_id> <message_id>")
+            return
+        try:
+            await message.bot.pin_chat_message(int(parts[0]), int(parts[1]))
+            await message.answer("✅ Xabar pin qilindi.")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ {exc}")
+
+    @dp.message(Command("cdelete"))
+    async def cdelete_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        parts = command_args(message).split()
+        if len(parts) < 2:
+            await message.answer("Foydalanish: /cdelete <chat_id> <message_id>")
+            return
+        try:
+            await message.bot.delete_message(int(parts[0]), int(parts[1]))
+            await message.answer("✅ Xabar o'chirildi.")
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ {exc}")
 
     @dp.message(Command("admin"))
     async def admin_handler(message: Message) -> None:
