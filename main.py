@@ -11,7 +11,7 @@ import re
 import shutil
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Set
@@ -307,6 +307,47 @@ sessions: Dict[int, UserSession] = {}
 rate_limits: Dict[int, list[float]] = {}
 
 
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+SESSION_TTL_SECONDS = 86400
+_redis = None
+if REDIS_URL:
+    try:
+        import redis as _redis_lib  # noqa: E402
+
+        _redis = _redis_lib.from_url(REDIS_URL, decode_responses=True)
+        _redis.ping()
+        logging.info("Redis ulandi: sessiya va rate-limit Redis'da saqlanadi")
+    except Exception as _redis_exc:  # noqa: BLE001
+        logging.warning("Redis ulanmadi, in-memory ishlatiladi: %s", _redis_exc)
+        _redis = None
+
+
+def _session_to_json(session: "UserSession") -> str:
+    data = asdict(session)
+    data["selected_projects"] = list(session.selected_projects)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _session_from_json(raw: str) -> "UserSession":
+    data = json.loads(raw)
+    data["selected_projects"] = set(data.get("selected_projects", []))
+    return UserSession(**data)
+
+
+def save_session(user_id: int) -> None:
+    """Sessiyani Redis'ga saqlaydi (Redis bo'lmasa hech narsa qilmaydi)."""
+    if _redis is None or user_id not in sessions:
+        return
+    try:
+        _redis.set(
+            f"session:{user_id}",
+            _session_to_json(sessions[user_id]),
+            ex=SESSION_TTL_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Redis sessiya saqlanmadi: %s", exc)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -315,13 +356,99 @@ def db_path() -> str:
     return os.getenv("DB_PATH", "orders.db")
 
 
-def db_connect() -> sqlite3.Connection:
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_POSTGRES = bool(DATABASE_URL)
+
+if IS_POSTGRES:
+    import psycopg  # noqa: E402
+
+
+class _HybridRow(dict):
+    """sqlite3.Row kabi — ustun nomi ham, butun indeks ham ishlaydi."""
+
+    __slots__ = ("_values",)
+
+    def __init__(self, columns, values):
+        super().__init__(zip(columns, values))
+        self._values = tuple(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+def _hybrid_row_factory(cursor):
+    columns = [c.name for c in cursor.description] if cursor.description else []
+
+    def make(values):
+        return _HybridRow(columns, values)
+
+    return make
+
+
+def _to_pg_sql(sql: str) -> str:
+    """SQLite SQL'ini PostgreSQL'ga moslaydi (DDL turlari + ? placeholder)."""
+    sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+    sql = re.sub(r"\bINTEGER\b", "BIGINT", sql)
+    sql = sql.replace("?", "%s")
+    return sql
+
+
+class _PgConnection:
+    """sqlite3.Connection API'sini taqlid qiladi: execute/fetch/commit + with-context."""
+
+    def __init__(self, url: str):
+        self._conn = psycopg.connect(url, row_factory=_hybrid_row_factory)
+
+    def execute(self, sql: str, params: Iterable = ()):
+        cursor = self._conn.cursor()
+        cursor.execute(_to_pg_sql(sql), tuple(params) if params else None)
+        return cursor
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+        return False
+
+
+def db_connect():
+    if IS_POSTGRES:
+        return _PgConnection(DATABASE_URL)
     connection = sqlite3.connect(db_path())
     connection.row_factory = sqlite3.Row
     return connection
 
 
-def ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+def db_insert(connection, sql: str, params: Iterable = ()) -> int:
+    """INSERT bajarib yangi qator id'sini qaytaradi (sqlite lastrowid / pg RETURNING id)."""
+    if IS_POSTGRES:
+        cursor = connection.execute(sql + " RETURNING id", params)
+        return int(cursor.fetchone()[0])
+    cursor = connection.execute(sql, params)
+    return int(cursor.lastrowid)
+
+
+def ensure_column(connection, table: str, column: str, definition: str) -> None:
+    if IS_POSTGRES:
+        connection.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"
+        )
+        return
     columns = {
         row["name"]
         for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -552,7 +679,8 @@ def create_order(user: User, session: UserSession) -> int:
     username = user.username or ""
     now = utc_now()
     with db_connect() as connection:
-        cursor = connection.execute(
+        return db_insert(
+            connection,
             """
             INSERT INTO orders (
                 user_id, full_name, username, projects, requirements, estimate, prepayment,
@@ -580,7 +708,6 @@ def create_order(user: User, session: UserSession) -> int:
                 now,
             ),
         )
-        return int(cursor.lastrowid)
 
 
 def create_web_order(
@@ -627,7 +754,8 @@ def create_web_order(
 
     now = utc_now()
     with db_connect() as connection:
-        cursor = connection.execute(
+        order_id = db_insert(
+            connection,
             """
             INSERT INTO orders (
                 user_id, full_name, username, projects, requirements, estimate, prepayment,
@@ -653,7 +781,6 @@ def create_web_order(
                 now,
             ),
         )
-        order_id = int(cursor.lastrowid)
     order = get_order(order_id)
     if order is None:
         raise RuntimeError("Buyurtma yaratilmadi.")
@@ -1049,7 +1176,8 @@ def latest_audit_logs(order_id: int | None = None, limit: int = 30) -> list[sqli
 def create_support_ticket(user: User, message: str) -> int:
     now = utc_now()
     with db_connect() as connection:
-        cursor = connection.execute(
+        return db_insert(
+            connection,
             """
             INSERT INTO support_tickets (
                 user_id, full_name, username, message, status, created_at, updated_at
@@ -1058,7 +1186,6 @@ def create_support_ticket(user: User, message: str) -> int:
             """,
             (user.id, user.full_name, user.username or "", message.strip(), now, now),
         )
-        return int(cursor.lastrowid)
 
 
 def create_web_support_ticket(
@@ -1069,7 +1196,8 @@ def create_web_support_ticket(
 ) -> int:
     now = utc_now()
     with db_connect() as connection:
-        cursor = connection.execute(
+        return db_insert(
+            connection,
             """
             INSERT INTO support_tickets (
                 user_id, full_name, username, message, status, created_at, updated_at
@@ -1078,7 +1206,6 @@ def create_web_support_ticket(
             """,
             (user_id, full_name, username, message.strip(), now, now),
         )
-        return int(cursor.lastrowid)
 
 
 def latest_support_tickets(status: str = "open", limit: int = 20) -> list[sqlite3.Row]:
@@ -1131,7 +1258,8 @@ def close_support_ticket(ticket_id: int) -> bool:
 def create_appointment(user: User, scheduled_at: str) -> int:
     now = utc_now()
     with db_connect() as connection:
-        cursor = connection.execute(
+        return db_insert(
+            connection,
             """
             INSERT INTO appointments (
                 user_id, full_name, username, scheduled_at, status, created_at, updated_at
@@ -1140,7 +1268,6 @@ def create_appointment(user: User, scheduled_at: str) -> int:
             """,
             (user.id, user.full_name, user.username or "", scheduled_at, now, now),
         )
-        return int(cursor.lastrowid)
 
 
 def latest_appointments(status: str = "pending", limit: int = 20) -> list[sqlite3.Row]:
@@ -1480,12 +1607,21 @@ def unblock_user(user_id: int) -> None:
 
 def get_session(user_id: int) -> UserSession:
     if user_id not in sessions:
+        if _redis is not None:
+            try:
+                raw = _redis.get(f"session:{user_id}")
+                if raw:
+                    sessions[user_id] = _session_from_json(raw)
+                    return sessions[user_id]
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Redis sessiya o'qilmadi: %s", exc)
         sessions[user_id] = UserSession()
     return sessions[user_id]
 
 
 def reset_session(user_id: int, is_admin_test: bool = False) -> UserSession:
     sessions[user_id] = UserSession(is_admin_test=is_admin_test)
+    save_session(user_id)
     return sessions[user_id]
 
 
@@ -1741,6 +1877,15 @@ def is_admin_user(user_id: int) -> bool:
 
 
 def is_rate_limited(user_id: int) -> bool:
+    if _redis is not None:
+        try:
+            key = f"rl:{user_id}"
+            count = _redis.incr(key)
+            if count == 1:
+                _redis.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+            return count > RATE_LIMIT_MAX_MESSAGES
+        except Exception:  # noqa: BLE001
+            pass
     now = time.monotonic()
     timestamps = [
         timestamp
@@ -1761,24 +1906,25 @@ class SecurityMiddleware(BaseMiddleware):
         if isinstance(event, Message):
             track_user(user)
 
-        if is_admin_user(user.id):
-            return await handler(event, data)
+        if not is_admin_user(user.id):
+            if is_blocked_user(user.id):
+                if isinstance(event, Message):
+                    await event.answer("Sizning profilingiz vaqtincha bloklangan. Admin bilan bog'laning.")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("Siz vaqtincha bloklangansiz.", show_alert=True)
+                return None
 
-        if is_blocked_user(user.id):
-            if isinstance(event, Message):
-                await event.answer("Sizning profilingiz vaqtincha bloklangan. Admin bilan bog'laning.")
-            elif isinstance(event, CallbackQuery):
-                await event.answer("Siz vaqtincha bloklangansiz.", show_alert=True)
-            return None
+            if is_rate_limited(user.id):
+                if isinstance(event, Message):
+                    await event.answer("Juda ko'p xabar yuborildi. Iltimos, biroz kutib yozing.")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("Biroz sekinroq.", show_alert=True)
+                return None
 
-        if is_rate_limited(user.id):
-            if isinstance(event, Message):
-                await event.answer("Juda ko'p xabar yuborildi. Iltimos, biroz kutib yozing.")
-            elif isinstance(event, CallbackQuery):
-                await event.answer("Biroz sekinroq.", show_alert=True)
-            return None
-
-        return await handler(event, data)
+        result = await handler(event, data)
+        # Handler sessiyani o'zgartirgan bo'lishi mumkin — Redis'ga saqlaymiz.
+        save_session(user.id)
+        return result
 
 
 def normalize_project_key(key: str) -> str:

@@ -73,11 +73,21 @@ Repo GitHubda: `https://github.com/zettacodetech/zettacodetechbot.git`. Railway 
    - `BOT_TOKEN`, `ADMIN_CHAT_ID`, `ADMIN_CHAT_IDS`, `GROQ_API_KEY`, `CARD_NUMBER`, `CARD_HOLDER`
    - `WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/app`
    - `WEB_ADMIN_TOKEN=...` (kuchli token tanlang)
+   - `DATABASE_URL=${{Postgres.DATABASE_URL}}` — Railway Postgres servisiga reference variable
+   - `REDIS_URL=${{Redis.REDIS_URL}}` — Railway Redis servisiga reference variable
    - `PORT` ni **qo'lda kiritmang** — Railway o'zi beradi.
 3. **Settings → Networking → Generate Domain** orqali `zettacodetechbot-production.up.railway.app` domeni ochiladi. `WEB_APP_URL` shu domenga mos bo'lsin.
 4. Deploy tugagach, Telegramda bot menyusidagi **Web App** tugmasi shu domendagi kalkulyatorni ochadi.
 
-> **Eslatma (ma'lumotlar bazasi):** Railway fayl tizimi vaqtinchalik — har deployda `orders.db` nolga tushadi. Doimiy saqlash uchun Railwayda **Volume** ulang (masalan `/data`) va `DB_PATH=/data/orders.db` qiling.
+## Ma'lumotlar bazasi (PostgreSQL / SQLite / Redis)
+
+Bot ikkita rejimda ishlaydi:
+
+- **`DATABASE_URL` mavjud bo'lsa → PostgreSQL** (doimiy, tavsiya etiladi). Railwayda Postgres servisini ulab, `DATABASE_URL=${{Postgres.DATABASE_URL}}` qo'ying. Barcha 14 jadval avtomatik yaratiladi.
+- **`DATABASE_URL` bo'lmasa → SQLite** (`DB_PATH`, lokal ishlab chiqish uchun qulay).
+- **`REDIS_URL` mavjud bo'lsa → sessiya va rate-limit Redis'da** saqlanadi (restart/deploy'da yo'qolmaydi). Bo'lmasa — in-memory (vaqtinchalik).
+
+> **Eslatma:** Railway konteyner fayl tizimi vaqtinchalik. SQLite ishlatilsa har deployda ma'lumot nolga tushadi — shu sabab Railwayda **PostgreSQL** ishlating. (Yoki vaqtinchalik yechim: Volume `/data` + `DB_PATH=/data/orders.db`.)
 
 > **Diqqat:** Bir vaqtning o'zida faqat bitta nusxa polling qilishi kerak. Railwayda ishga tushgach, lokal `python main.py` ni to'xtating (aks holda Telegram `Conflict` xatosi beradi).
 
