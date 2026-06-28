@@ -770,6 +770,25 @@ def init_db() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS keyword_replies (
+                keyword TEXT PRIMARY KEY,
+                reply TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS short_links (
+                code TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                clicks INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def register_managed_chat(
@@ -812,6 +831,88 @@ def get_managed_chat(chat_id: int):
         return connection.execute(
             "SELECT * FROM managed_chats WHERE chat_id = ?", (chat_id,)
         ).fetchone()
+
+
+# ---------- Keyword auto-reply (kalit so'zga avtomatik javob) ----------
+def add_keyword_reply(keyword: str, reply: str) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO keyword_replies (keyword, reply, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(keyword) DO UPDATE SET reply = excluded.reply
+            """,
+            (keyword.strip().lower(), reply.strip(), utc_now()),
+        )
+
+
+def delete_keyword_reply(keyword: str) -> bool:
+    with db_connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM keyword_replies WHERE keyword = ?", (keyword.strip().lower(),)
+        )
+        return cursor.rowcount > 0
+
+
+def get_keyword_reply(text: str) -> str | None:
+    with db_connect() as connection:
+        row = connection.execute(
+            "SELECT reply FROM keyword_replies WHERE keyword = ?", (text.strip().lower(),)
+        ).fetchone()
+    return row["reply"] if row else None
+
+
+def all_keyword_replies() -> list:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT * FROM keyword_replies ORDER BY keyword"
+            ).fetchall()
+        )
+
+
+# ---------- Link shortener (havola qisqartiruvchi) ----------
+def create_short_link(url: str) -> str:
+    import secrets
+
+    code = secrets.token_urlsafe(4)[:6]
+    with db_connect() as connection:
+        connection.execute(
+            "INSERT INTO short_links (code, url, clicks, created_at) VALUES (?, ?, 0, ?)",
+            (code, url.strip(), utc_now()),
+        )
+    return code
+
+
+def resolve_short_link(code: str) -> str | None:
+    with db_connect() as connection:
+        row = connection.execute(
+            "SELECT url FROM short_links WHERE code = ?", (code,)
+        ).fetchone()
+        if not row:
+            return None
+        connection.execute(
+            "UPDATE short_links SET clicks = clicks + 1 WHERE code = ?", (code,)
+        )
+    return row["url"]
+
+
+def all_short_links(limit: int = 30) -> list:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT * FROM short_links ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        )
+
+
+def public_base_url() -> str:
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip() or os.getenv("PUBLIC_DOMAIN", "").strip()
+    if domain:
+        return f"https://{domain}"
+    host = os.getenv("WEB_ADMIN_HOST", "127.0.0.1")
+    port = int(os.getenv("WEB_ADMIN_PORT", str(WEB_ADMIN_DEFAULT_PORT)))
+    return f"http://{host}:{port}"
 
 
 def track_user(user: User) -> None:
@@ -2084,6 +2185,17 @@ class SecurityMiddleware(BaseMiddleware):
             track_user(user)
 
         if not is_admin_user(user.id):
+            if get_system_state("maintenance") == "1":
+                msg = (
+                    "🛠 Bot vaqtincha texnik ishlar uchun to'xtatilgan. "
+                    "Iltimos, birozdan so'ng qayta urinib ko'ring."
+                )
+                if isinstance(event, Message):
+                    await event.answer(msg)
+                elif isinstance(event, CallbackQuery):
+                    await event.answer(msg, show_alert=True)
+                return None
+
             if is_blocked_user(user.id):
                 if isinstance(event, Message):
                     await event.answer("Sizning profilingiz vaqtincha bloklangan. Admin bilan bog'laning.")
@@ -4583,6 +4695,14 @@ async def web_order_detail(request: web.Request) -> web.Response:
     return web.Response(text=web_layout(f"Buyurtma #{order_id}", body), content_type="text/html")
 
 
+async def web_short_redirect(request: web.Request) -> web.StreamResponse:
+    code = request.match_info.get("code", "")
+    url = resolve_short_link(code)
+    if not url:
+        return web.Response(text="Havola topilmadi", status=404)
+    raise web.HTTPFound(location=url)
+
+
 async def web_healthz(request: web.Request) -> web.Response:
     """Railway/monitoring uchun health endpoint — DB va Redis holatini tekshiradi."""
     try:
@@ -4613,6 +4733,7 @@ async def start_web_admin(
     app = web.Application()
     app["bot"] = bot
     app.router.add_get("/healthz", web_healthz)
+    app.router.add_get("/s/{code}", web_short_redirect)
     # Webhook rejimi yoqilgan bo'lsa, Telegram update handler'ini ro'yxatdan o'tkazamiz.
     if webhook_path and dp is not None:
         from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -5064,6 +5185,109 @@ async def main() -> None:
             await message.answer("✅ Xabar o'chirildi.")
         except Exception as exc:  # noqa: BLE001
             await message.answer(f"❌ {exc}")
+
+    # ===================== Maintenance rejim =====================
+    @dp.message(Command("maintenance"))
+    async def maintenance_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        arg = command_args(message).strip().lower()
+        if arg in ("on", "1", "yoq", "yoqish"):
+            set_system_state("maintenance", "1")
+            await message.answer("🛠 Maintenance rejim YOQILDI. Mijozlar vaqtincha bloklanadi.")
+        elif arg in ("off", "0", "ochish"):
+            set_system_state("maintenance", "0")
+            await message.answer("✅ Maintenance rejim O'CHIRILDI. Bot normal ishlaydi.")
+        else:
+            holat = "yoniq" if get_system_state("maintenance") == "1" else "o'chiq"
+            await message.answer(f"Maintenance holati: {holat}\n\nFoydalanish: /maintenance on | off")
+
+    # ===================== Keyword auto-reply =====================
+    @dp.message(Command("addreply"))
+    async def addreply_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        args = command_args(message)
+        if "|" not in args:
+            await message.answer("Foydalanish: /addreply kalit so'z | javob matni")
+            return
+        keyword, reply = args.split("|", 1)
+        if not keyword.strip() or not reply.strip():
+            await message.answer("Kalit so'z va javob bo'sh bo'lmasin.")
+            return
+        add_keyword_reply(keyword, reply)
+        await message.answer(f"✅ Auto-reply saqlandi: «{keyword.strip().lower()}»")
+
+    @dp.message(Command("delreply"))
+    async def delreply_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        keyword = command_args(message).strip()
+        if not keyword:
+            await message.answer("Foydalanish: /delreply kalit so'z")
+            return
+        ok = delete_keyword_reply(keyword)
+        await message.answer("✅ O'chirildi." if ok else "Bunday kalit so'z topilmadi.")
+
+    @dp.message(Command("replies"))
+    async def replies_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        rows = all_keyword_replies()
+        if not rows:
+            await message.answer("Auto-reply'lar yo'q.\n\nQo'shish: /addreply kalit | javob")
+            return
+        lines = ["Auto-reply'lar:\n"]
+        for r in rows:
+            lines.append(f"• {r['keyword']} → {r['reply'][:60]}")
+        await message.answer("\n".join(lines))
+
+    # ===================== QR generator =====================
+    @dp.message(Command("qr"))
+    async def qr_handler(message: Message) -> None:
+        data = command_args(message).strip()
+        if not data:
+            await message.answer("Foydalanish: /qr <matn yoki havola>")
+            return
+        try:
+            from urllib.parse import quote
+
+            url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={quote(data)}"
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as client:
+                async with client.get(url) as resp:
+                    img = await resp.read()
+            await message.answer_photo(
+                BufferedInputFile(img, filename="qr.png"), caption="QR kod tayyor."
+            )
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"QR yaratilmadi: {exc}")
+
+    # ===================== Link shortener =====================
+    @dp.message(Command("short"))
+    async def short_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        url = command_args(message).strip()
+        if not url.startswith("http"):
+            await message.answer("Foydalanish: /short https://misol.uz/uzun/havola")
+            return
+        code = create_short_link(url)
+        await message.answer(f"🔗 Qisqa havola:\n{public_base_url()}/s/{code}")
+
+    @dp.message(Command("shortstats"))
+    async def shortstats_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            return
+        rows = all_short_links()
+        if not rows:
+            await message.answer("Qisqa havolalar yo'q.\n\nYaratish: /short <havola>")
+            return
+        base = public_base_url()
+        lines = ["Qisqa havolalar (bosishlar):\n"]
+        for r in rows:
+            lines.append(f"• {base}/s/{r['code']} → {r['clicks']} bosish\n   {r['url'][:50]}")
+        await message.answer("\n".join(lines))
 
     @dp.message(Command("admin"))
     async def admin_handler(message: Message) -> None:
@@ -6807,6 +7031,13 @@ async def main() -> None:
         if not text:
             await message.answer("Iltimos, xabarni matn ko'rinishida yuboring.")
             return
+
+        # Keyword auto-reply: idle holatdagi non-admin uchun aniq mos kalit so'zga javob
+        if not is_admin_user(message.from_user.id) and session.stage == "choose_project":
+            auto = get_keyword_reply(text)
+            if auto:
+                await message.answer(auto)
+                return
 
         if is_admin_user(message.from_user.id) and session.stage == "admin_note":
             if session.pending_note_order_id is None:
