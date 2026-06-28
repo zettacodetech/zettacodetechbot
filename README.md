@@ -35,6 +35,7 @@ PROMO_CODES=ZETTA10:10,START5:5
 ADMIN_ROLES=admin_id:super_admin,sotuvchi_id:sales
 WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/app
 WEB_APP_BUTTON_TEXT=Web App
+PROJECT_CHANNEL_USERNAME=zettacodetech
 WEBAPP_AUTH_MAX_AGE=86400
 WEBAPP_ALLOW_LOCAL_TEST=1
 REMINDER_AFTER_HOURS=3
@@ -91,6 +92,7 @@ User commandlar:
 - `/portfolio` - portfolio havolasi
 - `/contact` - admin bilan aloqa
 - `/status` - mijozning oxirgi buyurtma holati
+- `/timeline` - mijozning oxirgi buyurtma timeline holati
 - `/invoice` - mijozning oxirgi buyurtmasi uchun invoice PDF
 - `/contract` - mijozning oxirgi buyurtmasi uchun shartnoma draft PDF
 - `/support MATN` - support ticket ochish
@@ -115,6 +117,16 @@ Admin commandlar:
 - `/invoice BUYURTMA_ID` - invoice PDF olish
 - `/contract BUYURTMA_ID` - shartnoma draft PDF olish
 - `/kanban` - CRM Kanban ko'rinishini olish
+- `/dashboard` - chuqur savdo dashboard
+- `/customer USER_ID|@username` - mijoz kartasini ko'rish
+- `/timeline BUYURTMA_ID` - loyiha timeline ko'rish
+- `/lead BUYURTMA_ID` - lead scoring 2.0 natijasi
+- `/risk BUYURTMA_ID` - loyiha risk tahlili
+- `/templates [USER_ID]` - quick reply shablonlari
+- `/sendtemplate USER_ID KEY` - mijozga tayyor reply yuborish
+- `/postdraft BUYURTMA_ID` - portfolio/kanal post draft yaratish
+- `/blackliststats` - blok sabablar statistikasi
+- `/feedbacks` - oxirgi baholar va feedbacklar
 - `/stage BUYURTMA_ID BOSQICH` - CRM pipeline bosqichini o'zgartirish
 - `/task BUYURTMA_ID matn` - buyurtmaga vazifa qo'shish
 - `/tasks BUYURTMA_ID` - buyurtma vazifalarini ko'rish
@@ -198,6 +210,19 @@ Admin ID `.env` dagi `ADMIN_CHAT_ID` yoki `ADMIN_CHAT_IDS` ichida bo'lsa, `/star
 - Loyiha kalkulyatori: `/calc` yoki WebAppdagi shablon orqali bot mijozdan maqsad, user/admin amallari, saqlanadigan ma'lumotlar, integratsiyalar va naqd to'lov oqimini so'raydi.
 - Shartnoma generatori: `/contract` yoki admin panel tugmasi buyurtma bo'yicha dastlabki kelishuv PDFini yuboradi.
 - Admin Kanban: `/kanban`, admin inline panel va web admin panel CRM bosqichlarini Kanban ko'rinishida chiqaradi.
+- Lead scoring 2.0: leadlar `Juda issiq`, `Issiq`, `O'rta`, `Vaqt oladi`, `Sifatsiz` darajalarga ajratiladi.
+- Sales objection handling: mijoz `qimmat`, `keyin`, `muddat`, `predoplata` kabi e'tiroz yozsa, bot tayyor savdo skripti bilan javob beradi.
+- Mijoz kartasi: `/customer` orqali user tarixi, buyurtmalari, summa va oxirgi status ko'rinadi.
+- Timeline: `/timeline` buyurtmaning talabdan topshirishgacha bo'lgan bosqichlarini ko'rsatadi.
+- Delivery flow: admin CRM bosqichini `done` qilsa, mijozga rating va portfolio ruxsati tugmalari yuboriladi.
+- Feedback/rating: mijoz 1-5 baho beradi, admin `/feedbacks` orqali ko'radi.
+- Blacklist stats: `/blackliststats` bloklangan foydalanuvchilar sabablarini jamlaydi.
+- Quick reply templates: `/templates` va `/sendtemplate` orqali admin tayyor javoblarni mijozga yuboradi.
+- Portfolio post: `/postdraft` AI/fallback post draft yaratadi, admin tasdiqlasa `PROJECT_CHANNEL_USERNAME` kanaliga chiqaradi.
+- Risk tahlili: `/risk` buyurtma noaniqligi, muddat, narx va integratsiya xavflarini chiqaradi.
+- Chuqur dashboard: `/dashboard` konversiya, haftalik lead, o'rtacha narx va feedback statistikalarini ko'rsatadi.
+- Multi-admin routing: yangi lead, support, meeting, payment va report xabarlari mos admin rollariga yo'naltiriladi.
+- Talab namunasi: mijozga yaxshi yozilgan talab namunasi inline tugma orqali beriladi.
 - Avtomatik eslatma: narx olgan, chek yubormagan yoki admin bilan kelishishga o'tgan mijozlarga `REMINDER_AFTER_HOURS` soatdan keyin xabar yuboriladi.
 - AI va fallback baholash: narx bilan birga taxminiy muddat va lead score chiqadi.
 - PDF invoice: admin yoki mijoz buyurtma bo'yicha PDF invoice olishi mumkin.

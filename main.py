@@ -99,6 +99,7 @@ STATUS_LABELS = {
     "checking": "Admin tekshiryapti",
     "admin_contact": "Admin bilan kelishish kerak",
     "paid": "To'lov qabul qilindi",
+    "delivered": "Loyiha topshirildi",
     "rejected": "To'lov tasdiqlanmadi",
 }
 
@@ -206,6 +207,45 @@ CALCULATOR_QUESTIONS = [
     "Qanday ma'lumotlar saqlanadi? Masalan: mijoz, mahsulot, buyurtma, to'lov, ombor.",
     "Bildirishnoma, SMS, API, fayl yuklash yoki boshqa integratsiya kerakmi?",
     "Loyiha ichidagi to'lov faqat naqd bo'ladi. Naqd to'lov jarayoni qanday ishlaydi?",
+]
+SALES_OBJECTION_KEYWORDS = {
+    "expensive": ("qimmat", "arzon", "tushirib", "chegirma", "skidka", "narx baland"),
+    "later": ("keyin", "ertaga", "o'ylab", "uylab", "kut", "hozir emas", "hali"),
+    "prepayment": ("oldindan", "predoplata", "avans", "yarmini", "to'lamayman", "tolamayman"),
+    "deadline": ("muddat", "qachon", "necha kun", "tez", "shoshilinch"),
+}
+SALES_OBJECTION_REPLIES = {
+    "expensive": (
+        "Narx loyiha funksiyalari va mas'uliyatidan kelib chiqib qo'yildi. Bu summaga faqat kod emas, "
+        "talablarni tartibga solish, tizimni sozlash, test qilish va topshirilgandan keyingi boshlang'ich qo'llab-quvvatlash ham kiradi.\n\n"
+        "Agar byudjetni kamaytirish kerak bo'lsa, funksiyalarni MVP ko'rinishida qisqartirib, qayta baholab beraman."
+    ),
+    "later": (
+        "Tushunarli. Loyiha bo'yicha joy band qilinishi va ish rejasiga kiritilishi uchun predoplata kerak bo'ladi. "
+        "Hozir boshlashga tayyor bo'lmasangiz, admin bilan kelishib vaqtni aniqlashtirishingiz mumkin."
+    ),
+    "prepayment": (
+        "ZettaCode Tech ishni boshlashi uchun 50% predoplata talab qilinadi. Bu loyiha vaqtini band qilish va ishni rasmiy boshlash uchun kerak.\n\n"
+        "Agar oldindan to'lov bo'yicha kelishmoqchi bo'lsangiz, admin bilan gaplashishingiz mumkin."
+    ),
+    "deadline": (
+        "Taxminiy muddat talablar murakkabligiga qarab belgilanadi. Shoshilinch loyiha bo'lsa, funksiyalarni MVP qilib qisqartirish yoki "
+        "admin bilan ustuvorlikni kelishish mumkin."
+    ),
+}
+ADMIN_REPLY_TEMPLATES = {
+    "price": "Narx loyiha murakkabligi, admin panel, test va boshlang'ich qo'llab-quvvatlashni hisobga olib berilgan.",
+    "receipt": "Chekingiz admin tomonidan tekshirilmoqda. Iltimos, biroz kuting.",
+    "deadline": "Muddat loyiha funksiyalari tasdiqlangandan keyin aniq belgilanadi. Hozirgi taxminiy muddat buyurtma tafsilotida ko'rsatilgan.",
+    "requirements": "Aniq narx uchun loyiha maqsadi, user/admin amallari va asosiy funksiyalarni batafsil yozib bering.",
+    "prepayment": "Ish boshlanishi uchun kelishilgan summaning 50% qismi plastik karta orqali predoplata qilinadi.",
+}
+TIMELINE_STEPS = [
+    ("requirements", "Talab olindi"),
+    ("priced", "Narx berildi"),
+    ("prepayment", "Predoplata jarayoni"),
+    ("in_progress", "Ish jarayoni"),
+    ("done", "Topshirildi"),
 ]
 
 
@@ -457,6 +497,20 @@ def init_db() -> None:
                 admin_id INTEGER NOT NULL,
                 note TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                rating INTEGER NOT NULL DEFAULT 0,
+                comment TEXT NOT NULL DEFAULT '',
+                portfolio_permission INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
             """
         )
@@ -748,6 +802,32 @@ def latest_order_for_user(user_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def orders_for_user(user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        )
+
+
+def find_user(identifier: str) -> sqlite3.Row | None:
+    clean = identifier.strip().lstrip("@")
+    if not clean:
+        return None
+    with db_connect() as connection:
+        if clean.isdigit():
+            return connection.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (int(clean),),
+            ).fetchone()
+        return connection.execute(
+            "SELECT * FROM users WHERE username = ? COLLATE NOCASE ORDER BY last_seen DESC LIMIT 1",
+            (clean,),
+        ).fetchone()
+
+
 def order_notes(order_id: int) -> list[sqlite3.Row]:
     with db_connect() as connection:
         return list(
@@ -767,6 +847,96 @@ def add_order_note(order_id: int, admin_id: int, note: str) -> bool:
             (order_id, admin_id, note.strip(), utc_now()),
         )
     return True
+
+
+def save_order_feedback(
+    order_id: int,
+    user_id: int,
+    *,
+    rating: int | None = None,
+    comment: str | None = None,
+    portfolio_permission: bool | None = None,
+) -> None:
+    now = utc_now()
+    existing = None
+    with db_connect() as connection:
+        existing = connection.execute(
+            "SELECT id FROM order_feedback WHERE order_id = ? AND user_id = ? ORDER BY id DESC LIMIT 1",
+            (order_id, user_id),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO order_feedback (
+                    order_id, user_id, rating, comment, portfolio_permission, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    user_id,
+                    rating or 0,
+                    (comment or "").strip(),
+                    None if portfolio_permission is None else int(portfolio_permission),
+                    now,
+                    now,
+                ),
+            )
+            return
+
+        fields = ["updated_at = ?"]
+        values: list[Any] = [now]
+        if rating is not None:
+            fields.append("rating = ?")
+            values.append(rating)
+        if comment is not None:
+            fields.append("comment = ?")
+            values.append(comment.strip())
+        if portfolio_permission is not None:
+            fields.append("portfolio_permission = ?")
+            values.append(int(portfolio_permission))
+        values.append(int(existing["id"]))
+        connection.execute(
+            f"UPDATE order_feedback SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+
+
+def latest_feedback(limit: int = 20) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                """
+                SELECT f.*, o.full_name, o.username, o.projects
+                FROM order_feedback f
+                JOIN orders o ON o.id = f.order_id
+                ORDER BY f.id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        )
+
+
+def feedback_stats() -> tuple[int, float]:
+    with db_connect() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count, COALESCE(AVG(rating), 0) AS avg_rating FROM order_feedback WHERE rating > 0"
+        ).fetchone()
+        return int(row["count"]), float(row["avg_rating"])
+
+
+def blacklist_reason_stats() -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                """
+                SELECT COALESCE(NULLIF(TRIM(reason), ''), 'sababsiz') AS reason, COUNT(*) AS count
+                FROM blocked_users
+                GROUP BY COALESCE(NULLIF(TRIM(reason), ''), 'sababsiz')
+                ORDER BY count DESC, reason ASC
+                """
+            ).fetchall()
+        )
 
 
 def add_order_task(order_id: int, task: str, assignee: str = "", deadline: str = "") -> bool:
@@ -1144,6 +1314,14 @@ def has_permission(user_id: int, permission: str) -> bool:
     return "all" in allowed or permission in allowed
 
 
+def admin_ids_for_permission(permission: str | None = None) -> list[int]:
+    roles = configured_admin_roles()
+    if permission is None:
+        return list(roles.keys())
+    routed = [user_id for user_id in roles if has_permission(user_id, permission)]
+    return routed or list(roles.keys())
+
+
 def get_system_state(key: str, default: str = "") -> str:
     with db_connect() as connection:
         row = connection.execute(
@@ -1171,7 +1349,7 @@ def order_stats() -> tuple[int, int, list[sqlite3.Row]]:
     with db_connect() as connection:
         total = connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
         paid_sum = connection.execute(
-            "SELECT COALESCE(SUM(estimate), 0) FROM orders WHERE status = 'paid'"
+            "SELECT COALESCE(SUM(estimate), 0) FROM orders WHERE status IN ('paid', 'delivered')"
         ).fetchone()[0]
         statuses = list(
             connection.execute(
@@ -1381,6 +1559,7 @@ def user_help_text() -> str:
         "/status - oxirgi buyurtma holati\n"
         "/invoice - oxirgi buyurtma invoice PDF\n"
         "/contract - oxirgi buyurtma shartnoma PDF\n"
+        "/timeline - oxirgi buyurtma timeline\n"
         "/support MATN - support murojaati\n"
         "/meeting YYYY-MM-DD HH:MM - uchrashuv so'rash\n"
         "/referral - referral kodingiz\n"
@@ -1407,6 +1586,16 @@ def admin_help_text() -> str:
         "/invoice ID - invoice PDF\n"
         "/contract ID - shartnoma PDF\n"
         "/kanban - CRM Kanban ko'rinishi\n"
+        "/dashboard - chuqur savdo dashboard\n"
+        "/customer USER_ID|@username - mijoz kartasi\n"
+        "/timeline ID - loyiha timeline\n"
+        "/lead ID - lead scoring 2.0\n"
+        "/risk ID - loyiha risk tahlili\n"
+        "/templates [USER_ID] - quick reply shablonlari\n"
+        "/sendtemplate USER_ID KEY - shablon yuborish\n"
+        "/postdraft ID - portfolio/kanal post draft\n"
+        "/blackliststats - blok sabablar statistikasi\n"
+        "/feedbacks - oxirgi feedbacklar\n"
         "/stage ID BOSQICH - CRM bosqichini o'zgartirish\n"
         "/task ID matn - buyurtmaga vazifa qo'shish\n"
         "/tasks ID - vazifalar ro'yxati\n"
@@ -1430,7 +1619,7 @@ def admin_help_text() -> str:
         "/block USER_ID sabab - foydalanuvchini bloklash\n"
         "/unblock USER_ID - blokdan chiqarish\n"
         "/backup - database backup faylini olish\n\n"
-        "User commandlar ham ishlaydi: /start, /new, /calc, /prices, /portfolio, /contact, /status, /invoice, /contract, /support, /meeting, /referral, /ref, /faq, /promo, /help, /cancel."
+        "User commandlar ham ishlaydi: /start, /new, /calc, /prices, /portfolio, /contact, /status, /timeline, /invoice, /contract, /support, /meeting, /referral, /ref, /faq, /promo, /help, /cancel."
     )
 
 
@@ -1443,6 +1632,7 @@ def user_bot_commands() -> list[BotCommand]:
         BotCommand(command="portfolio", description="Portfolioni ko'rish"),
         BotCommand(command="contact", description="Admin bilan aloqa"),
         BotCommand(command="status", description="Buyurtma holati"),
+        BotCommand(command="timeline", description="Buyurtma timeline"),
         BotCommand(command="invoice", description="Invoice PDF"),
         BotCommand(command="contract", description="Shartnoma PDF"),
         BotCommand(command="support", description="Support murojaati"),
@@ -1468,6 +1658,16 @@ def admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="invoice", description="Invoice PDF"),
         BotCommand(command="contract", description="Shartnoma PDF"),
         BotCommand(command="kanban", description="CRM Kanban"),
+        BotCommand(command="dashboard", description="Chuqur dashboard"),
+        BotCommand(command="customer", description="Mijoz kartasi"),
+        BotCommand(command="timeline", description="Loyiha timeline"),
+        BotCommand(command="lead", description="Lead scoring"),
+        BotCommand(command="risk", description="Risk tahlil"),
+        BotCommand(command="templates", description="Reply shablonlar"),
+        BotCommand(command="sendtemplate", description="Shablon yuborish"),
+        BotCommand(command="postdraft", description="Kanal post draft"),
+        BotCommand(command="blackliststats", description="Blacklist statistikasi"),
+        BotCommand(command="feedbacks", description="Feedbacklar"),
         BotCommand(command="stage", description="CRM bosqich"),
         BotCommand(command="task", description="Vazifa qo'shish"),
         BotCommand(command="tasks", description="Vazifalar"),
@@ -1720,11 +1920,15 @@ def estimate_duration_label(session: UserSession, estimate: int | None = None) -
 def lead_score_label(session: UserSession, estimate: int | None = None) -> str:
     score = 0
     text = session.requirements.lower()
+    weak_phrases = ("bilmayman", "shunchaki", "keyin", "arzon", "tekinga", "test", "o'ylab", "uylab")
+    serious_phrases = ("tayyorman", "boshlaymiz", "bugun", "ertaga", "tez", "shoshilinch", "admin panel", "crm")
+    if len(session.requirements.strip()) < 80:
+        score -= 2
     if len(session.requirements) >= 180:
         score += 2
     elif len(session.requirements) >= 90:
         score += 1
-    if any(word in text for word in ("tez", "bugun", "ertaga", "shoshilinch", "boshlash")):
+    if any(word in text for word in serious_phrases):
         score += 2
     if any(word in text for word in ("admin panel", "crm", "buyurtma", "katalog", "dostavka", "hisobot")):
         score += 1
@@ -1732,12 +1936,20 @@ def lead_score_label(session: UserSession, estimate: int | None = None) -> str:
         score += 1
     if session.promo_code:
         score += 1
+    if any(word in text for word in weak_phrases):
+        score -= 1
+    if session.off_topic_count >= 2:
+        score -= 2
 
-    if score >= 5:
+    if score >= 6:
+        return "Juda issiq lead"
+    if score >= 4:
         return "Issiq lead"
-    if score >= 3:
+    if score >= 2:
         return "O'rta lead"
-    return "Sovuq lead"
+    if score >= 0:
+        return "Vaqt oladi"
+    return "Sifatsiz lead"
 
 
 def portfolio_category_for_project_keys(keys: Iterable[str]) -> str:
@@ -1768,6 +1980,15 @@ def calculator_prompt_for_session(session: UserSession) -> str:
         f"{project_hint} uchun loyiha kalkulyatori.\n\n"
         "Quyidagi savollarga bitta xabarda javob yozing. Javob qancha aniq bo'lsa, narx ham shuncha aniq chiqadi:\n\n"
         f"{questions}"
+    )
+
+
+def requirements_example_text() -> str:
+    return (
+        "Talab namunasi:\n\n"
+        "Menga restoran uchun Telegram buyurtma boti kerak. Mijoz menyudan taomlarni ko'radi, savatchaga qo'shadi, "
+        "telefon raqami va manzilini yuboradi, to'lov naqd bo'ladi. Admin panelda buyurtmalarni ko'radi, statusini "
+        "o'zgartiradi, kurerga uzatadi va kunlik hisobotni ko'radi. Menyu mahsulotlarini admin qo'sha olishi kerak."
     )
 
 
@@ -2357,6 +2578,7 @@ def welcome_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Buyurtma holati", callback_data="menu:status"),
                 InlineKeyboardButton(text="FAQ", callback_data="menu:faq"),
             ],
+            [InlineKeyboardButton(text="Talab namunasi", callback_data="menu:example")],
             [InlineKeyboardButton(text="Loyiha turini tanlash", callback_data="menu:choose_project")],
         ]
     )
@@ -2400,6 +2622,7 @@ def contact_inline_keyboard() -> InlineKeyboardMarkup:
 
 def requirements_keyboard(has_requirements: bool) -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton(text="Talab namunasi", callback_data="requirements:example")],
         [InlineKeyboardButton(text="Yana talab qo'shish", callback_data="requirements:more")],
         [InlineKeyboardButton(text="Talablarni qayta yozish", callback_data="requirements:edit")],
         [InlineKeyboardButton(text="Loyiha turini o'zgartirish", callback_data="requirements:change_project")],
@@ -2497,6 +2720,11 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Broadcast", callback_data="panel:broadcast"),
                 InlineKeyboardButton(text="AI holati", callback_data="panel:ai_status"),
             ],
+            [
+                InlineKeyboardButton(text="Dashboard", callback_data="panel:dashboard"),
+                InlineKeyboardButton(text="Feedback", callback_data="panel:feedbacks"),
+            ],
+            [InlineKeyboardButton(text="Blacklist stats", callback_data="panel:blackliststats")],
             [InlineKeyboardButton(text="Web panel", url=web_admin_url())],
             [InlineKeyboardButton(text="Mijoz sifatida test", callback_data="panel:test_order")],
         ]
@@ -2577,6 +2805,24 @@ def order_detail_keyboard(order: sqlite3.Row) -> InlineKeyboardMarkup:
     )
     rows.append(
         [
+            InlineKeyboardButton(text="Timeline", callback_data=f"panel:timeline:{order['id']}"),
+            InlineKeyboardButton(text="Risk tahlil", callback_data=f"panel:risk:{order['id']}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="Mijoz kartasi", callback_data=f"panel:customer:{order['user_id']}"),
+            InlineKeyboardButton(text="Reply shablon", callback_data=f"panel:templates:{order['id']}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="Post draft", callback_data=f"panel:postdraft:{order['id']}"),
+            InlineKeyboardButton(text="Feedbacklar", callback_data="panel:feedbacks"),
+        ]
+    )
+    rows.append(
+        [
             InlineKeyboardButton(text="Ish boshlandi", callback_data=f"panel:stage:{order['id']}:in_progress"),
             InlineKeyboardButton(text="Tugatildi", callback_data=f"panel:stage:{order['id']}:done"),
         ]
@@ -2584,6 +2830,43 @@ def order_detail_keyboard(order: sqlite3.Row) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="Buyurtmalar", callback_data="panel:orders")])
     rows.append([InlineKeyboardButton(text="Admin panel", callback_data="panel:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def feedback_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=str(rating), callback_data=f"feedback:rate:{order_id}:{rating}")
+                for rating in range(1, 6)
+            ],
+            [
+                InlineKeyboardButton(text="Portfolio uchun ruxsat", callback_data=f"feedback:portfolio:{order_id}:yes"),
+                InlineKeyboardButton(text="Ruxsat yo'q", callback_data=f"feedback:portfolio:{order_id}:no"),
+            ],
+        ]
+    )
+
+
+def template_keyboard(user_id: int, order_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    for key in ADMIN_REPLY_TEMPLATES:
+        suffix = f":{order_id}" if order_id is not None else ""
+        rows.append(
+            [InlineKeyboardButton(text=key, callback_data=f"template:send:{user_id}:{key}{suffix}")]
+        )
+    rows.append([InlineKeyboardButton(text="Admin panel", callback_data="panel:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def post_confirm_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Kanalga chiqarish", callback_data=f"post:send:{order_id}"),
+                InlineKeyboardButton(text="Bekor qilish", callback_data=f"post:cancel:{order_id}"),
+            ]
+        ]
+    )
 
 
 async def safe_edit_or_answer(
@@ -2858,6 +3141,221 @@ def format_kanban_text(limit_per_stage: int = 6) -> str:
     return "\n".join(lines)
 
 
+def detect_sales_objection(text: str) -> str | None:
+    normalized_text = text.lower()
+    for key, keywords in SALES_OBJECTION_KEYWORDS.items():
+        if any(keyword in normalized_text for keyword in keywords):
+            return key
+    return None
+
+
+def format_customer_card(identifier: str) -> str:
+    user = find_user(identifier)
+    if user is None:
+        return "Mijoz topilmadi."
+    orders = orders_for_user(int(user["user_id"]), limit=10)
+    total = sum(int(order["estimate"]) for order in orders)
+    paid_total = sum(
+        int(order["estimate"])
+        for order in orders
+        if order["status"] in {"paid", "delivered"}
+    )
+    latest = orders[0] if orders else None
+    username = f"@{user['username']}" if user["username"] else "username yo'q"
+    lines = [
+        "Mijoz kartasi:",
+        "",
+        f"ID: {user['user_id']}",
+        f"Ism: {user['full_name']} ({username})",
+        f"Birinchi kirgan: {user['first_seen']}",
+        f"Oxirgi aktiv: {user['last_seen']}",
+        f"Buyurtmalar soni: {len(orders)}",
+        f"Umumiy baholangan summa: ${total}",
+        f"Tasdiqlangan summa: ${paid_total}",
+    ]
+    if latest is not None:
+        lines.extend(
+            [
+                "",
+                "Oxirgi buyurtma:",
+                f"#{latest['id']} | {STATUS_LABELS.get(latest['status'], latest['status'])}",
+                f"Loyiha: {projects_from_order(latest)}",
+                f"Narx: ${latest['estimate']}",
+                f"Lead: {latest['lead_score'] or '-'}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def format_order_timeline(order: sqlite3.Row) -> str:
+    current_stage = order["pipeline_stage"]
+    reached = True
+    lines = [f"Buyurtma #{order['id']} timeline:"]
+    for stage, title in TIMELINE_STEPS:
+        marker = "[x]" if reached else "[ ]"
+        if stage == current_stage:
+            marker = "[>]"
+            reached = False
+        if order["status"] == "delivered" and stage == "done":
+            marker = "[x]"
+        lines.append(f"{marker} {title}")
+    lines.extend(
+        [
+            "",
+            f"Status: {STATUS_LABELS.get(order['status'], order['status'])}",
+            f"CRM bosqich: {PIPELINE_STAGES.get(order['pipeline_stage'], order['pipeline_stage'])}",
+            f"Yangilangan: {order['updated_at']}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_blacklist_stats() -> str:
+    rows = blacklist_reason_stats()
+    if not rows:
+        return "Blacklist statistikasi: hozircha bloklangan foydalanuvchi yo'q."
+    lines = ["Blacklist sabablar statistikasi:"]
+    lines.extend(f"- {row['reason']}: {row['count']}" for row in rows)
+    return "\n".join(lines)
+
+
+def format_feedbacks_text(limit: int = 10) -> str:
+    rows = latest_feedback(limit=limit)
+    if not rows:
+        return "Feedbacklar hali yo'q."
+    lines = ["Oxirgi feedbacklar:"]
+    for row in rows:
+        permission = row["portfolio_permission"]
+        permission_text = "portfolio: -" if permission is None else f"portfolio: {'ha' if permission else 'yoq'}"
+        lines.append(
+            f"#{row['order_id']} | {row['rating']}/5 | {row['full_name']} (@{row['username'] or 'username yoq'}) | {permission_text}\n"
+            f"{row['comment'] or '-'}"
+        )
+    return "\n\n".join(lines)
+
+
+def format_deep_dashboard() -> str:
+    now = datetime.now(timezone.utc)
+    week_ago = (now - timedelta(days=7)).isoformat(timespec="seconds")
+    with db_connect() as connection:
+        total = int(connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0])
+        weekly = int(connection.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (week_ago,)).fetchone()[0])
+        paid = int(connection.execute("SELECT COUNT(*) FROM orders WHERE status IN ('paid', 'delivered')").fetchone()[0])
+        rejected = int(connection.execute("SELECT COUNT(*) FROM orders WHERE status = 'rejected'").fetchone()[0])
+        avg_price = float(connection.execute("SELECT COALESCE(AVG(estimate), 0) FROM orders").fetchone()[0])
+        waiting = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM orders WHERE status IN ('payment_confirmation', 'awaiting_receipt', 'admin_contact')"
+            ).fetchone()[0]
+        )
+    feedback_count, avg_rating = feedback_stats()
+    conversion = round((paid / total) * 100, 1) if total else 0
+    return (
+        "Chuqur dashboard:\n\n"
+        f"Jami leadlar: {total}\n"
+        f"Oxirgi 7 kun leadlari: {weekly}\n"
+        f"Tasdiqlangan buyurtmalar: {paid}\n"
+        f"Rad etilganlar: {rejected}\n"
+        f"To'lov/kelishuv kutilmoqda: {waiting}\n"
+        f"Konversiya: {conversion}%\n"
+        f"O'rtacha narx: ${round(avg_price)}\n"
+        f"Feedbacklar: {feedback_count}\n"
+        f"O'rtacha baho: {avg_rating:.1f}/5"
+    )
+
+
+def fallback_project_risk(order: sqlite3.Row) -> str:
+    text = order["requirements"].lower()
+    risks = []
+    if len(order["requirements"]) < 180:
+        risks.append("Talablar qisqa, texnik tafsilotlarni admin bilan aniqlashtirish kerak.")
+    if any(keyword in text for keyword in ("tez", "shoshilinch", "bugun", "ertaga")):
+        risks.append("Muddat bosimi bor, scope qisqartirilmasa kechikish xavfi yuqori.")
+    if any(keyword in text for keyword in ("api", "integratsiya", "sms", "ai", "sun'iy")):
+        risks.append("Integratsiya bor, tashqi servislar sababli qo'shimcha tekshiruv kerak.")
+    if order["lead_score"] in {"Sifatsiz lead", "Vaqt oladi"}:
+        risks.append("Lead sifati pastroq, savdo bosqichida qayta kvalifikatsiya kerak.")
+    if not risks:
+        risks.append("Katta xavf ko'rinmadi, lekin scope va muddat yozma tasdiqlansin.")
+    return "Loyiha risk tahlili:\n\n" + "\n".join(f"- {risk}" for risk in risks)
+
+
+async def ai_project_risk(order: sqlite3.Row) -> str:
+    fallback = fallback_project_risk(order)
+    if not os.getenv("GROQ_API_KEY"):
+        return fallback
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Sen ZettaCode Tech uchun loyiha risk tahlilchisisan. O'zbek tilida qisqa yoz. "
+                "Talab noaniqligi, muddat, narx, integratsiya va mijoz sifati bo'yicha xavflarni ayt. "
+                "Javob faqat JSON: {\"risk\": string}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Buyurtma #{order['id']}\n"
+                f"Loyiha: {projects_from_order(order)}\n"
+                f"Narx: ${order['estimate']}\n"
+                f"Lead: {order['lead_score']}\n"
+                f"Talablar:\n{order['requirements']}"
+            ),
+        },
+    ]
+    try:
+        parsed = await groq_json(messages, max_tokens=700, temperature=0.15)
+        risk = str(parsed.get("risk") or "").strip()
+        return risk or fallback
+    except Exception as exc:
+        logging.warning("Risk AI tahlili ishlamadi: %s", exc)
+        return fallback
+
+
+def fallback_portfolio_case(order: sqlite3.Row) -> str:
+    return (
+        f"ZettaCode Tech yangi loyiha case:\n\n"
+        f"Loyiha turi: {projects_from_order(order)}\n"
+        f"Vazifa: {order['ai_summary'] or 'Mijoz biznes jarayonini raqamlashtirish.'}\n"
+        f"Yechim: {', '.join(json.loads(order['ai_features'] or '[]')[:4]) or 'Bot/sayt/CRM funksiyalari ishlab chiqildi.'}\n"
+        "To'lov oqimi: loyiha ichida faqat naqd to'lov siyosati.\n\n"
+        "ZettaCode Tech - biznesingizni avtomatlashtiramiz."
+    )
+
+
+async def ai_portfolio_case(order: sqlite3.Row) -> str:
+    fallback = fallback_portfolio_case(order)
+    if not os.getenv("GROQ_API_KEY"):
+        return fallback
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Sen ZettaCode Tech uchun Telegram kanalga portfolio post draft yozasan. "
+                "O'zbek tilida, qisqa, sotuvga mos, lekin mijoz maxfiy ma'lumotlarini ochmasdan yoz. "
+                "Online to'lov integratsiyasini reklama qilma. Javob faqat JSON: {\"post\": string}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Loyiha: {projects_from_order(order)}\n"
+                f"Tahlil: {order['ai_summary']}\n"
+                f"Funksiyalar: {order['ai_features']}\n"
+                f"Talablar:\n{order['requirements']}"
+            ),
+        },
+    ]
+    try:
+        parsed = await groq_json(messages, max_tokens=700, temperature=0.25)
+        post = str(parsed.get("post") or "").strip()
+        return post or fallback
+    except Exception as exc:
+        logging.warning("Portfolio post AI orqali yaratilmadi: %s", exc)
+        return fallback
+
+
 def ai_status_text() -> str:
     api_key = os.getenv("GROQ_API_KEY")
     model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
@@ -3071,8 +3569,9 @@ async def notify_admins(
     bot: Bot,
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
+    permission: str | None = None,
 ) -> None:
-    for admin_id in configured_admin_roles():
+    for admin_id in admin_ids_for_permission(permission):
         try:
             await bot.send_message(admin_id, text, reply_markup=reply_markup)
         except Exception as exc:
@@ -3188,6 +3687,26 @@ async def send_contract_pdf(message: Message, order: sqlite3.Row) -> None:
     )
 
 
+def project_channel_target() -> str:
+    target = (
+        os.getenv("PROJECT_CHANNEL_ID", "").strip()
+        or os.getenv("PROJECT_CHANNEL_USERNAME", "").strip()
+        or os.getenv("CHANNEL_USERNAME", "").strip()
+    )
+    if target and not target.startswith("@") and not target.lstrip("-").isdigit():
+        return f"@{target}"
+    return target
+
+
+async def send_delivery_flow(bot: Bot, order: sqlite3.Row) -> None:
+    await bot.send_message(
+        order["user_id"],
+        f"Buyurtma #{order['id']} bo'yicha loyiha topshirildi deb belgilandi.\n\n"
+        "Iltimos, xizmatimizni 1 dan 5 gacha baholang va portfolio uchun ruxsatni belgilang.",
+        reply_markup=feedback_keyboard(order["id"]),
+    )
+
+
 def format_tasks_text(order_id: int, include_done: bool = True) -> str:
     tasks = order_tasks(order_id, include_done=include_done)
     if not tasks:
@@ -3228,6 +3747,7 @@ async def reminder_loop(bot: Bot) -> None:
                     f"Eslatma yuborildi: buyurtma #{order['id']}\n"
                     f"Mijoz: {order['full_name']} (@{order['username'] or 'username yoq'})\n"
                     f"Holat: {status}",
+                    permission="orders",
                 )
             except Exception as exc:
                 logging.warning("Reminder yuborilmadi: %s", exc)
@@ -3243,6 +3763,7 @@ async def reminder_loop(bot: Bot) -> None:
                     bot,
                     f"Uchrashuv eslatmasi #{appointment['id']}\n"
                     f"Mijoz: {appointment['full_name']}\nVaqt: {local_time}",
+                    permission="meeting",
                 )
                 mark_appointment_reminded(appointment["id"])
             except Exception as exc:
@@ -3267,7 +3788,7 @@ async def monitoring_loop(bot: Bot) -> None:
             local_now = datetime.now().astimezone()
             last_report_date = get_system_state("daily_report_date")
             if local_now.hour >= report_hour and last_report_date != local_now.date().isoformat():
-                await notify_admins(bot, await ai_sales_report())
+                await notify_admins(bot, await ai_sales_report(), permission="report")
                 set_system_state("daily_report_date", local_now.date().isoformat())
         except Exception as exc:
             logging.exception("Monitoring tekshiruvi xatosi: %s", exc)
@@ -3473,6 +3994,7 @@ async def webapp_order_api(request: web.Request) -> web.Response:
                 [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{order['id']}")]
             ]
         ),
+        permission="orders",
     )
     return web.json_response(
         {
@@ -3532,6 +4054,7 @@ async def webapp_support_api(request: web.Request) -> web.Response:
         f"Web App support ticket #{ticket_id}\n"
         f"Mijoz: {full_name} (@{username or 'username yoq'})\n"
         f"Xabar: {message}",
+        permission="support",
     )
     return web.json_response({"ticket_id": ticket_id})
 
@@ -3776,6 +4299,7 @@ async def finalize_estimate(message: Message, user: User, session: UserSession, 
                     [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{session.order_id}")]
                 ]
             ),
+            permission="orders",
         )
 
 
@@ -3928,6 +4452,21 @@ async def main() -> None:
     async def status_handler(message: Message) -> None:
         await show_user_status(message)
 
+    @dp.message(Command("timeline"))
+    async def timeline_handler(message: Message) -> None:
+        args = command_args(message)
+        if is_admin_user(message.from_user.id) and args:
+            if not args.isdigit():
+                await message.answer("Timeline olish: /timeline BUYURTMA_ID")
+                return
+            order = get_order(int(args))
+        else:
+            order = latest_order_for_user(message.from_user.id)
+        if order is None:
+            await message.answer("Timeline uchun buyurtma topilmadi.")
+            return
+        await message.answer(format_order_timeline(order))
+
     @dp.message(Command("invoice"))
     async def invoice_handler(message: Message) -> None:
         args = command_args(message)
@@ -3973,6 +4512,7 @@ async def main() -> None:
             f"Yangi support ticket #{ticket_id}\n"
             f"Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'username yoq'})\n"
             f"Xabar: {text}",
+            permission="support",
         )
 
     @dp.message(Command("meeting"))
@@ -3998,6 +4538,7 @@ async def main() -> None:
             f"Yangi uchrashuv so'rovi #{appointment_id}\n"
             f"Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'username yoq'})\n"
             f"Vaqt: {value}",
+            permission="meeting",
         )
 
     @dp.message(Command("referral"))
@@ -4088,12 +4629,81 @@ async def main() -> None:
             return
         await message.answer(format_stats_text(), reply_markup=admin_panel_keyboard())
 
+    @dp.message(Command("dashboard"))
+    async def dashboard_handler(message: Message) -> None:
+        if not has_permission(message.from_user.id, "report"):
+            await message.answer("Bu command uchun hisobot ruxsati kerak.")
+            return
+        await message.answer(format_deep_dashboard(), reply_markup=admin_panel_keyboard())
+
     @dp.message(Command("kanban"))
     async def kanban_handler(message: Message) -> None:
         if not is_admin_user(message.from_user.id):
             await message.answer("Bu command faqat admin uchun.")
             return
         await send_long_message(message, format_kanban_text())
+
+    @dp.message(Command("customer"))
+    async def customer_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        identifier = command_args(message)
+        if not identifier:
+            await message.answer("Mijoz kartasi: /customer USER_ID yoki /customer @username")
+            return
+        await message.answer(format_customer_card(identifier))
+
+    @dp.message(Command("lead"))
+    async def lead_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        order_id_text = command_args(message)
+        if not order_id_text.isdigit():
+            await message.answer("Lead scoring: /lead BUYURTMA_ID")
+            return
+        order = get_order(int(order_id_text))
+        if order is None:
+            await message.answer("Buyurtma topilmadi.")
+            return
+        await message.answer(
+            f"Buyurtma #{order['id']} lead scoring 2.0:\n\n"
+            f"Daraja: {order['lead_score'] or '-'}\n"
+            f"Narx: ${order['estimate']}\n"
+            f"Status: {STATUS_LABELS.get(order['status'], order['status'])}\n"
+            f"CRM: {PIPELINE_STAGES.get(order['pipeline_stage'], order['pipeline_stage'])}"
+        )
+
+    @dp.message(Command("risk"))
+    async def risk_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        order_id_text = command_args(message)
+        if not order_id_text.isdigit():
+            await message.answer("Risk tahlil: /risk BUYURTMA_ID")
+            return
+        order = get_order(int(order_id_text))
+        if order is None:
+            await message.answer("Buyurtma topilmadi.")
+            return
+        await message.answer("Risk tahlil tayyorlanyapti...")
+        await send_long_message(message, await ai_project_risk(order))
+
+    @dp.message(Command("feedbacks"))
+    async def feedbacks_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await send_long_message(message, format_feedbacks_text())
+
+    @dp.message(Command("blackliststats"))
+    async def blacklist_stats_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await message.answer(format_blacklist_stats())
 
     @dp.message(Command("ai"))
     async def ai_handler(message: Message) -> None:
@@ -4194,7 +4804,16 @@ async def main() -> None:
             await message.answer("Buyurtma topilmadi.")
             return
         update_order_metadata(order_id, pipeline_stage=args[1])
+        if args[1] == "done":
+            update_order_status(order_id, "delivered")
         log_audit(message.from_user.id, "pipeline_change", "order", order_id, args[1])
+        if args[1] == "done":
+            order = get_order(order_id)
+            if order is not None:
+                try:
+                    await send_delivery_flow(bot, order)
+                except Exception as exc:
+                    logging.warning("Delivery flow yuborilmadi: %s", exc)
         await message.answer(f"Buyurtma #{order_id} CRM bosqichi: {PIPELINE_STAGES[args[1]]}")
 
     @dp.message(Command("task"))
@@ -4294,6 +4913,55 @@ async def main() -> None:
         update_order_metadata(order_id, assignee=args[1])
         log_audit(message.from_user.id, "assignee_set", "order", order_id, args[1])
         await message.answer(f"Buyurtma #{order_id} mas'ul: {args[1]}")
+
+    @dp.message(Command("templates"))
+    async def templates_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        target = command_args(message)
+        lines = ["Quick reply shablonlari:"]
+        lines.extend(f"- {key}: {value}" for key, value in ADMIN_REPLY_TEMPLATES.items())
+        if target and target.lstrip("@").isdigit():
+            await message.answer(
+                "\n".join(lines) + "\n\nShablonni yuborish uchun tugmani bosing.",
+                reply_markup=template_keyboard(int(target.lstrip("@"))),
+            )
+            return
+        await message.answer("\n".join(lines) + "\n\nYuborish: /sendtemplate USER_ID KEY")
+
+    @dp.message(Command("sendtemplate"))
+    async def send_template_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        args = command_args(message).split(maxsplit=1)
+        if len(args) != 2 or not args[0].isdigit() or args[1] not in ADMIN_REPLY_TEMPLATES:
+            await message.answer("Shablon yuborish: /sendtemplate USER_ID price|receipt|deadline|requirements|prepayment")
+            return
+        user_id = int(args[0])
+        template_key = args[1]
+        await bot.send_message(user_id, ADMIN_REPLY_TEMPLATES[template_key])
+        log_audit(message.from_user.id, "template_send", "user", user_id, template_key)
+        await message.answer(f"Shablon yuborildi: {template_key}")
+
+    @dp.message(Command("postdraft"))
+    async def post_draft_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        order_id_text = command_args(message)
+        if not order_id_text.isdigit():
+            await message.answer("Post draft: /postdraft BUYURTMA_ID")
+            return
+        order = get_order(int(order_id_text))
+        if order is None:
+            await message.answer("Buyurtma topilmadi.")
+            return
+        await message.answer("Portfolio post draft tayyorlanyapti...")
+        post = await ai_portfolio_case(order)
+        await send_long_message(message, post)
+        await message.answer("Kanalga chiqarilsinmi?", reply_markup=post_confirm_keyboard(order["id"]))
 
     @dp.message(Command("web"))
     async def web_handler(message: Message) -> None:
@@ -4548,6 +5216,11 @@ async def main() -> None:
             await callback.answer()
             return
 
+        if action == "example":
+            await callback.message.answer(requirements_example_text())
+            await callback.answer("Namuna yuborildi.")
+            return
+
         if action == "home":
             if is_admin_user(callback.from_user.id):
                 await show_admin_panel(callback.message)
@@ -4656,6 +5329,33 @@ async def main() -> None:
             await callback.answer()
             return
 
+        if action == "dashboard":
+            await safe_edit_or_answer(
+                callback,
+                format_deep_dashboard(),
+                reply_markup=admin_panel_keyboard(),
+            )
+            await callback.answer()
+            return
+
+        if action == "feedbacks":
+            await safe_edit_or_answer(
+                callback,
+                format_feedbacks_text(),
+                reply_markup=admin_panel_keyboard(),
+            )
+            await callback.answer()
+            return
+
+        if action == "blackliststats":
+            await safe_edit_or_answer(
+                callback,
+                format_blacklist_stats(),
+                reply_markup=admin_panel_keyboard(),
+            )
+            await callback.answer()
+            return
+
         if action == "pipeline" and len(parts) == 3:
             stage = parts[2]
             if stage not in PIPELINE_STAGES:
@@ -4704,8 +5404,15 @@ async def main() -> None:
                 await callback.answer("Buyurtma topilmadi.", show_alert=True)
                 return
             update_order_metadata(order_id, pipeline_stage=stage)
+            if stage == "done":
+                update_order_status(order_id, "delivered")
             log_audit(callback.from_user.id, "pipeline_change", "order", order_id, stage)
             order = get_order(order_id)
+            if stage == "done" and order is not None:
+                try:
+                    await send_delivery_flow(bot, order)
+                except Exception as exc:
+                    logging.warning("Delivery flow yuborilmadi: %s", exc)
             await safe_edit_or_answer(
                 callback,
                 format_order_detail(order),
@@ -4766,6 +5473,74 @@ async def main() -> None:
                 reply_markup=portfolio_keyboard(),
             )
             await callback.answer("Mos portfolio yuborildi.")
+            return
+
+        if action == "timeline" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            order = get_order(order_id)
+            if order is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            await callback.message.answer(format_order_timeline(order))
+            await callback.answer("Timeline yuborildi.")
+            return
+
+        if action == "risk" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            order = get_order(order_id)
+            if order is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            await callback.message.answer("Risk tahlil tayyorlanyapti...")
+            await send_long_message(callback.message, await ai_project_risk(order))
+            await callback.answer("Risk tahlil yuborildi.")
+            return
+
+        if action == "customer" and len(parts) == 3:
+            await callback.message.answer(format_customer_card(parts[2]))
+            await callback.answer("Mijoz kartasi yuborildi.")
+            return
+
+        if action == "templates" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            order = get_order(order_id)
+            if order is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            await callback.message.answer(
+                "Mijozga qaysi reply shablon yuborilsin?",
+                reply_markup=template_keyboard(order["user_id"], order["id"]),
+            )
+            await callback.answer()
+            return
+
+        if action == "postdraft" and len(parts) == 3:
+            try:
+                order_id = int(parts[2])
+            except ValueError:
+                await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+                return
+            order = get_order(order_id)
+            if order is None:
+                await callback.answer("Buyurtma topilmadi.", show_alert=True)
+                return
+            await callback.message.answer("Portfolio post draft tayyorlanyapti...")
+            post = await ai_portfolio_case(order)
+            await send_long_message(callback.message, post)
+            await callback.message.answer("Kanalga chiqarilsinmi?", reply_markup=post_confirm_keyboard(order["id"]))
+            await callback.answer("Post draft yuborildi.")
             return
 
         if action == "task" and len(parts) == 3:
@@ -4922,6 +5697,11 @@ async def main() -> None:
             await callback.answer()
             return
 
+        if action == "example":
+            await callback.message.answer(requirements_example_text())
+            await callback.answer("Namuna yuborildi.")
+            return
+
         if action == "edit":
             session.requirements = ""
             session.requirements_validated = False
@@ -5039,7 +5819,7 @@ async def main() -> None:
             "Iltimos, biroz kuting..."
         )
 
-        admin_ids = list(configured_admin_roles())
+        admin_ids = admin_ids_for_permission("payment")
         if not admin_ids:
             logging.warning("Admin ID sozlanmagan, chek adminga yuborilmadi.")
             return
@@ -5095,6 +5875,7 @@ async def main() -> None:
                         [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{session.order_id}")]
                     ]
                 ),
+                permission="orders",
             )
             await callback.answer()
             return
@@ -5214,6 +5995,117 @@ async def main() -> None:
 
         await callback.answer()
 
+    @dp.callback_query(F.data.startswith("feedback:"))
+    async def feedback_callback(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        if len(parts) < 4:
+            await callback.answer()
+            return
+        action = parts[1]
+        try:
+            order_id = int(parts[2])
+        except ValueError:
+            await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+            return
+        order = get_order(order_id)
+        if order is None or int(order["user_id"]) != callback.from_user.id:
+            await callback.answer("Bu feedback sizning buyurtmangiz uchun emas.", show_alert=True)
+            return
+        if action == "rate":
+            try:
+                rating = int(parts[3])
+            except ValueError:
+                await callback.answer("Baho noto'g'ri.", show_alert=True)
+                return
+            rating = min(5, max(1, rating))
+            save_order_feedback(order_id, callback.from_user.id, rating=rating)
+            await callback.message.answer(
+                f"Rahmat, bahoyingiz qabul qilindi: {rating}/5.\n"
+                "Qo'shimcha fikringiz bo'lsa, support orqali yozishingiz mumkin."
+            )
+            await notify_admins(
+                bot,
+                f"Feedback keldi: buyurtma #{order_id}\n"
+                f"Mijoz: {callback.from_user.full_name} (@{callback.from_user.username or 'username yoq'})\n"
+                f"Baho: {rating}/5",
+                permission="report",
+            )
+            await callback.answer("Baho saqlandi.")
+            return
+        if action == "portfolio":
+            permission = parts[3] == "yes"
+            save_order_feedback(order_id, callback.from_user.id, portfolio_permission=permission)
+            await callback.message.answer(
+                "Portfolio ruxsatingiz saqlandi. Rahmat."
+                if permission
+                else "Portfolio uchun ruxsat berilmadi deb saqlandi."
+            )
+            await notify_admins(
+                bot,
+                f"Portfolio ruxsati: buyurtma #{order_id} - {'ha' if permission else 'yoq'}",
+                permission="report",
+            )
+            await callback.answer("Ruxsat saqlandi.")
+            return
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("template:"))
+    async def template_callback(callback: CallbackQuery) -> None:
+        if not is_admin_user(callback.from_user.id):
+            await callback.answer("Bu tugma faqat admin uchun.", show_alert=True)
+            return
+        parts = callback.data.split(":")
+        if len(parts) not in (4, 5) or parts[1] != "send":
+            await callback.answer()
+            return
+        try:
+            user_id = int(parts[2])
+        except ValueError:
+            await callback.answer("User ID noto'g'ri.", show_alert=True)
+            return
+        key = parts[3]
+        if key not in ADMIN_REPLY_TEMPLATES:
+            await callback.answer("Shablon topilmadi.", show_alert=True)
+            return
+        await bot.send_message(user_id, ADMIN_REPLY_TEMPLATES[key])
+        entity_id = int(parts[4]) if len(parts) == 5 and parts[4].isdigit() else user_id
+        log_audit(callback.from_user.id, "template_send", "order" if len(parts) == 5 else "user", entity_id, key)
+        await callback.answer("Shablon yuborildi.")
+
+    @dp.callback_query(F.data.startswith("post:"))
+    async def post_callback(callback: CallbackQuery) -> None:
+        if not is_admin_user(callback.from_user.id):
+            await callback.answer("Bu tugma faqat admin uchun.", show_alert=True)
+            return
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await callback.answer()
+            return
+        action = parts[1]
+        try:
+            order_id = int(parts[2])
+        except ValueError:
+            await callback.answer("Buyurtma ID noto'g'ri.", show_alert=True)
+            return
+        if action == "cancel":
+            await callback.answer("Bekor qilindi.")
+            return
+        if action != "send":
+            await callback.answer()
+            return
+        target = project_channel_target()
+        if not target:
+            await callback.answer("CHANNEL_USERNAME yoki PROJECT_CHANNEL_ID sozlanmagan.", show_alert=True)
+            return
+        order = get_order(order_id)
+        if order is None:
+            await callback.answer("Buyurtma topilmadi.", show_alert=True)
+            return
+        post = await ai_portfolio_case(order)
+        await bot.send_message(target, post)
+        log_audit(callback.from_user.id, "channel_post_send", "order", order_id)
+        await callback.answer("Kanalga yuborildi.")
+
     @dp.message()
     async def text_handler(message: Message) -> None:
         session = get_session(message.from_user.id)
@@ -5280,6 +6172,7 @@ async def main() -> None:
                 f"Yangi support ticket #{ticket_id}\n"
                 f"Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'username yoq'})\n"
                 f"Xabar: {text}",
+                permission="support",
             )
             return
 
@@ -5367,7 +6260,17 @@ async def main() -> None:
                             [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{session.order_id}")]
                         ]
                     ),
+                    permission="orders",
                 )
+                return
+            objection = detect_sales_objection(text)
+            if objection is not None:
+                await message.answer(
+                    SALES_OBJECTION_REPLIES[objection] + "\n\nTo'lov qilishga rozimisiz?",
+                    reply_markup=payment_keyboard(),
+                )
+                if session.order_id is not None:
+                    log_audit(0, f"customer_objection_{objection}", "order", session.order_id, text[:200])
                 return
             await message.answer(
                 "To'lov qilishga rozimisiz?",
