@@ -1921,6 +1921,15 @@ class SecurityMiddleware(BaseMiddleware):
                     await event.answer("Biroz sekinroq.", show_alert=True)
                 return None
 
+            if subscription_required():
+                is_checksub = (
+                    isinstance(event, CallbackQuery) and (event.data or "").startswith("checksub")
+                )
+                bot = data.get("bot")
+                if bot is not None and not is_checksub and not await is_user_subscribed(bot, user.id):
+                    await prompt_subscribe(event)
+                    return None
+
         result = await handler(event, data)
         # Handler sessiyani o'zgartirgan bo'lishi mumkin — Redis'ga saqlaymiz.
         save_session(user.id)
@@ -3876,6 +3885,69 @@ def project_channel_target() -> str:
     return target
 
 
+_sub_cache: dict[int, float] = {}
+
+
+def subscription_required() -> bool:
+    return os.getenv("REQUIRE_SUBSCRIPTION", "0").strip() in {"1", "true", "True", "ha"}
+
+
+async def is_user_subscribed(bot: Bot, user_id: int) -> bool:
+    """Foydalanuvchi majburiy kanalga obuna bo'lganmi. Xato/kanal yo'q bo'lsa — ruxsat (fail-open)."""
+    channel = project_channel_target()
+    if not channel:
+        return True
+    now = time.time()
+    if _redis is not None:
+        try:
+            if _redis.get(f"sub:{user_id}") == "1":
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    elif _sub_cache.get(user_id, 0) > now:
+        return True
+    try:
+        member = await bot.get_chat_member(channel, user_id)
+        subscribed = member.status in {"creator", "administrator", "member"}
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Obuna tekshiruvi xatosi (%s): %s", channel, exc)
+        return True
+    if subscribed:
+        if _redis is not None:
+            try:
+                _redis.set(f"sub:{user_id}", "1", ex=600)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            _sub_cache[user_id] = now + 600
+    return subscribed
+
+
+def subscribe_prompt_keyboard() -> InlineKeyboardMarkup:
+    channel = project_channel_target()
+    rows = []
+    if channel.startswith("@"):
+        rows.append(
+            [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{channel.lstrip('@')}")]
+        )
+    rows.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="checksub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def prompt_subscribe(event: Any) -> None:
+    text = (
+        "Botdan to'liq foydalanish uchun avval rasmiy kanalimizga obuna bo'ling, "
+        "so'ng \"✅ Tekshirish\" tugmasini bosing."
+    )
+    keyboard = subscribe_prompt_keyboard()
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+        if event.message:
+            await event.message.answer(text, reply_markup=keyboard)
+    else:
+        await event.answer(text, reply_markup=keyboard)
+
+
 async def send_delivery_flow(bot: Bot, order: sqlite3.Row) -> None:
     await bot.send_message(
         order["user_id"],
@@ -5366,6 +5438,23 @@ async def main() -> None:
         unblock_user(int(user_id_text))
         log_audit(message.from_user.id, "user_unblock", "user", int(user_id_text))
         await message.answer(f"User {user_id_text} blokdan chiqarildi.")
+
+    @dp.callback_query(F.data == "checksub")
+    async def checksub_callback(callback: CallbackQuery) -> None:
+        if await is_user_subscribed(callback.bot, callback.from_user.id):
+            await callback.answer("Rahmat! Endi botdan foydalanishingiz mumkin.", show_alert=True)
+            try:
+                if callback.message:
+                    await callback.message.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            if callback.message:
+                await callback.message.answer("Asosiy menyu uchun /start ni bosing.")
+        else:
+            await callback.answer(
+                "Hali obuna bo'lmadingiz. Kanalga obuna bo'lib, qayta bosing.",
+                show_alert=True,
+            )
 
     @dp.callback_query(F.data.startswith("menu:"))
     async def menu_callback(callback: CallbackQuery) -> None:
