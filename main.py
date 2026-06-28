@@ -3666,22 +3666,54 @@ async def send_orders_export(message: Message) -> None:
     await message.answer_document(file, caption="Buyurtmalar CSV export fayli.")
 
 
-async def send_database_backup(message: Message) -> None:
-    source = db_path()
-    if not os.path.exists(source):
-        await message.answer("Database fayli topilmadi.")
-        return
+BACKUP_TABLES = [
+    "orders", "users", "order_tasks", "project_files", "blocked_users",
+    "order_notes", "order_feedback", "support_tickets", "appointments",
+    "referral_codes", "referrals", "admin_roles", "audit_logs", "system_state",
+]
 
-    os.makedirs("backups", exist_ok=True)
-    backup_name = f"orders_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    backup_path = os.path.join("backups", backup_name)
-    shutil.copy2(source, backup_path)
-    with open(backup_path, "rb") as file_obj:
-        data = file_obj.read()
+
+def build_full_backup() -> tuple[bytes, str]:
+    """Barcha jadvallarni JSON'ga yig'adi — SQLite ham, PostgreSQL ham ishlaydi."""
+    dump: dict[str, list] = {}
+    with db_connect() as connection:
+        for table in BACKUP_TABLES:
+            try:
+                rows = connection.execute(f"SELECT * FROM {table}").fetchall()
+                dump[table] = [dict(row) for row in rows]
+            except Exception as exc:  # noqa: BLE001
+                dump[table] = []
+                logging.warning("Backup: '%s' jadvali o'qilmadi: %s", table, exc)
+    payload = {
+        "generated_at": utc_now(),
+        "backend": "postgres" if IS_POSTGRES else "sqlite",
+        "tables": dump,
+    }
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    name = f"zettacode_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    return data, name
+
+
+async def send_database_backup(message: Message) -> None:
+    data, name = build_full_backup()
     await message.answer_document(
-        BufferedInputFile(data, filename=backup_name),
-        caption=f"Database backup yaratildi: {backup_name}",
+        BufferedInputFile(data, filename=name),
+        caption=f"To'liq backup (JSON, barcha jadvallar): {name}",
     )
+
+
+async def send_backup_to_admins(bot: Bot) -> None:
+    """Avtomatik kunlik backup'ni barcha adminlarga yuboradi."""
+    data, name = build_full_backup()
+    for admin_id in admin_chat_ids():
+        try:
+            await bot.send_document(
+                admin_id,
+                BufferedInputFile(data, filename=name),
+                caption=f"Avtomatik kunlik backup: {name}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Backup admin'ga yuborilmadi (%s): %s", admin_id, exc)
 
 
 async def broadcast_to_users(bot: Bot, admin_message: Message, text: str) -> None:
@@ -3936,6 +3968,12 @@ async def monitoring_loop(bot: Bot) -> None:
             if local_now.hour >= report_hour and last_report_date != local_now.date().isoformat():
                 await notify_admins(bot, await ai_sales_report(), permission="report")
                 set_system_state("daily_report_date", local_now.date().isoformat())
+
+            # Avtomatik kunlik backup (kuniga bir marta, hisobot vaqtida)
+            last_backup_date = get_system_state("daily_backup_date")
+            if local_now.hour >= report_hour and last_backup_date != local_now.date().isoformat():
+                await send_backup_to_admins(bot)
+                set_system_state("daily_backup_date", local_now.date().isoformat())
         except Exception as exc:
             logging.exception("Monitoring tekshiruvi xatosi: %s", exc)
             last_error = get_system_state("monitor_last_error")
@@ -4296,6 +4334,22 @@ async def web_order_detail(request: web.Request) -> web.Response:
     return web.Response(text=web_layout(f"Buyurtma #{order_id}", body), content_type="text/html")
 
 
+async def web_healthz(request: web.Request) -> web.Response:
+    """Railway/monitoring uchun health endpoint — DB va Redis holatini tekshiradi."""
+    try:
+        with db_connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+        return web.json_response(
+            {
+                "status": "ok",
+                "backend": "postgres" if IS_POSTGRES else "sqlite",
+                "redis": _redis is not None,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response({"status": "error", "detail": str(exc)}, status=503)
+
+
 async def start_web_admin(bot: Bot) -> web.AppRunner | None:
     railway_port = os.getenv("PORT")
     admin_enabled = os.getenv("WEB_ADMIN_ENABLED", "1").strip() not in {"0", "false", "False", "yoq"}
@@ -4304,6 +4358,7 @@ async def start_web_admin(bot: Bot) -> web.AppRunner | None:
         return None
     app = web.Application()
     app["bot"] = bot
+    app.router.add_get("/healthz", web_healthz)
     app.router.add_get("/", web_app_page)
     app.router.add_get("/app", web_app_page)
     app.router.add_get("/app/{filename}", webapp_static)
