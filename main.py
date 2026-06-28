@@ -1,6 +1,8 @@
 import asyncio
 import csv
+import hashlib
 import html
+import hmac
 import io
 import json
 import logging
@@ -11,8 +13,10 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, Set
 from unicodedata import normalize
+from urllib.parse import parse_qsl
 
 import aiohttp
 from aiohttp import web
@@ -186,7 +190,10 @@ RATE_LIMIT_WINDOW_SECONDS = 8
 RATE_LIMIT_MAX_MESSAGES = 8
 DEFAULT_REMINDER_AFTER_HOURS = 24
 WEB_ADMIN_DEFAULT_PORT = 8088
-WEBAPP_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "index.html")
+APP_ROOT = Path(__file__).resolve().parent
+WEBAPP_ROOT = APP_ROOT / "webapp"
+WEBAPP_HTML_PATH = WEBAPP_ROOT / "index.html"
+BOT_STARTED_AT = datetime.now(timezone.utc)
 PROMO_CODES = {
     "ZETTA10": 10,
     "START5": 5,
@@ -329,6 +336,102 @@ def init_db() -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS project_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                order_id INTEGER,
+                file_id TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER,
+                details TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                full_name TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL,
+                admin_reply TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                full_name TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
+                scheduled_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reminded_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referral_codes (
+                user_id INTEGER PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_user_id INTEGER NOT NULL,
+                referred_user_id INTEGER NOT NULL UNIQUE,
+                code TEXT NOT NULL,
+                rewarded INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_roles (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT NOT NULL,
+                updated_by INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS blocked_users (
                 user_id INTEGER PRIMARY KEY,
                 reason TEXT NOT NULL DEFAULT '',
@@ -365,6 +468,22 @@ def track_user(user: User) -> None:
         )
 
 
+def track_web_user(user_id: int, full_name: str, username: str = "") -> None:
+    now = utc_now()
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO users (user_id, full_name, username, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                full_name = excluded.full_name,
+                username = excluded.username,
+                last_seen = excluded.last_seen
+            """,
+            (user_id, full_name, username, now, now),
+        )
+
+
 def create_order(user: User, session: UserSession) -> int:
     username = user.username or ""
     now = utc_now()
@@ -398,6 +517,83 @@ def create_order(user: User, session: UserSession) -> int:
             ),
         )
         return int(cursor.lastrowid)
+
+
+def create_web_order(
+    user_id: int,
+    full_name: str,
+    username: str,
+    project_key: str,
+    requirements: str,
+    analysis: EstimateResult | None = None,
+) -> sqlite3.Row:
+    project_key = normalize_project_key(project_key)
+    if project_key not in PROJECT_PRICES:
+        raise ValueError("Loyiha turi noto'g'ri.")
+
+    clean_requirements = normalize_payment_policy_text(requirements.strip())
+    session = UserSession(
+        stage="payment_confirmation",
+        selected_projects={project_key},
+        requirements=clean_requirements,
+        requirements_validated=True,
+    )
+    validation = local_requirement_validation(session)
+    if len(requirements.strip()) < 40 or not validation.enough:
+        raise ValueError(
+            "Bu ma'lumot kam. Loyiha vazifalari, foydalanuvchi va admin amallarini batafsilroq yozing."
+        )
+
+    fallback_estimate = calculate_fallback_estimate(session)
+    session.estimate = analysis.estimate if analysis is not None else fallback_estimate
+    session.prepayment = session.estimate // 2
+    session.ai_summary = (
+        analysis.summary
+        if analysis is not None
+        else "Web App orqali yuborilgan talablar minimal narx va funksional murakkablik bo'yicha baholandi."
+    )
+    session.ai_features = (
+        analysis.features
+        if analysis is not None
+        else ["Mijoz talablari", "Asosiy ishlab chiqish", "Boshlang'ich sozlash"]
+    )
+    session.ai_used = bool(analysis and analysis.ai_used)
+    session.estimated_duration = estimate_duration_label(session, session.estimate)
+    session.lead_score = lead_score_label(session, session.estimate)
+
+    now = utc_now()
+    with db_connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO orders (
+                user_id, full_name, username, projects, requirements, estimate, prepayment,
+                ai_summary, ai_features, ai_used, status, pipeline_stage, lead_score,
+                estimated_duration, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'payment_confirmation', 'priced', ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                full_name,
+                username,
+                project_key,
+                clean_requirements,
+                session.estimate,
+                session.prepayment,
+                session.ai_summary,
+                json.dumps(session.ai_features, ensure_ascii=False),
+                1 if session.ai_used else 0,
+                session.lead_score,
+                session.estimated_duration,
+                now,
+                now,
+            ),
+        )
+        order_id = int(cursor.lastrowid)
+    order = get_order(order_id)
+    if order is None:
+        raise RuntimeError("Buyurtma yaratilmadi.")
+    return order
 
 
 def update_order_status(
@@ -595,6 +791,370 @@ def mark_task_done(task_id: int) -> bool:
             (utc_now(), task_id),
         )
         return cursor.rowcount > 0
+
+
+def save_project_file(
+    user_id: int,
+    file_id: str,
+    file_type: str,
+    file_name: str = "",
+    order_id: int | None = None,
+) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO project_files (user_id, order_id, file_id, file_type, file_name, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, order_id, file_id, file_type, file_name, utc_now()),
+        )
+
+
+def attach_pending_files(user_id: int, order_id: int) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            "UPDATE project_files SET order_id = ? WHERE user_id = ? AND order_id IS NULL",
+            (order_id, user_id),
+        )
+
+
+def order_files(order_id: int) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        return list(
+            connection.execute(
+                "SELECT * FROM project_files WHERE order_id = ? ORDER BY id DESC",
+                (order_id,),
+            ).fetchall()
+        )
+
+
+def log_audit(
+    admin_id: int,
+    action: str,
+    entity_type: str,
+    entity_id: int | None = None,
+    details: str = "",
+) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO audit_logs (admin_id, action, entity_type, entity_id, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (admin_id, action, entity_type, entity_id, details.strip(), utc_now()),
+        )
+
+
+def latest_audit_logs(order_id: int | None = None, limit: int = 30) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        if order_id is None:
+            return list(
+                connection.execute(
+                    "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            )
+        return list(
+            connection.execute(
+                """
+                SELECT * FROM audit_logs
+                WHERE entity_type = 'order' AND entity_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (order_id, limit),
+            ).fetchall()
+        )
+
+
+def create_support_ticket(user: User, message: str) -> int:
+    now = utc_now()
+    with db_connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO support_tickets (
+                user_id, full_name, username, message, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, 'open', ?, ?)
+            """,
+            (user.id, user.full_name, user.username or "", message.strip(), now, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def create_web_support_ticket(
+    user_id: int,
+    full_name: str,
+    username: str,
+    message: str,
+) -> int:
+    now = utc_now()
+    with db_connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO support_tickets (
+                user_id, full_name, username, message, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, 'open', ?, ?)
+            """,
+            (user_id, full_name, username, message.strip(), now, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def latest_support_tickets(status: str = "open", limit: int = 20) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        if status == "all":
+            return list(
+                connection.execute(
+                    "SELECT * FROM support_tickets ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            )
+        return list(
+            connection.execute(
+                "SELECT * FROM support_tickets WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        )
+
+
+def get_support_ticket(ticket_id: int) -> sqlite3.Row | None:
+    with db_connect() as connection:
+        return connection.execute(
+            "SELECT * FROM support_tickets WHERE id = ?",
+            (ticket_id,),
+        ).fetchone()
+
+
+def reply_support_ticket(ticket_id: int, reply: str) -> sqlite3.Row | None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            UPDATE support_tickets
+            SET admin_reply = ?, status = 'answered', updated_at = ?
+            WHERE id = ?
+            """,
+            (reply.strip(), utc_now(), ticket_id),
+        )
+    return get_support_ticket(ticket_id)
+
+
+def close_support_ticket(ticket_id: int) -> bool:
+    with db_connect() as connection:
+        cursor = connection.execute(
+            "UPDATE support_tickets SET status = 'closed', updated_at = ? WHERE id = ?",
+            (utc_now(), ticket_id),
+        )
+        return cursor.rowcount > 0
+
+
+def create_appointment(user: User, scheduled_at: str) -> int:
+    now = utc_now()
+    with db_connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO appointments (
+                user_id, full_name, username, scheduled_at, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (user.id, user.full_name, user.username or "", scheduled_at, now, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def latest_appointments(status: str = "pending", limit: int = 20) -> list[sqlite3.Row]:
+    with db_connect() as connection:
+        if status == "all":
+            return list(
+                connection.execute(
+                    "SELECT * FROM appointments ORDER BY scheduled_at ASC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            )
+        return list(
+            connection.execute(
+                "SELECT * FROM appointments WHERE status = ? ORDER BY scheduled_at ASC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        )
+
+
+def update_appointment_status(appointment_id: int, status: str) -> sqlite3.Row | None:
+    with db_connect() as connection:
+        connection.execute(
+            "UPDATE appointments SET status = ?, updated_at = ? WHERE id = ?",
+            (status, utc_now(), appointment_id),
+        )
+        return connection.execute(
+            "SELECT * FROM appointments WHERE id = ?",
+            (appointment_id,),
+        ).fetchone()
+
+
+def pending_appointment_reminders() -> list[sqlite3.Row]:
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=2)
+    result = []
+    for row in latest_appointments(status="confirmed", limit=100):
+        if row["reminded_at"]:
+            continue
+        try:
+            scheduled_at = datetime.fromisoformat(row["scheduled_at"])
+        except ValueError:
+            continue
+        if now <= scheduled_at <= end:
+            result.append(row)
+    return result
+
+
+def mark_appointment_reminded(appointment_id: int) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            "UPDATE appointments SET reminded_at = ?, updated_at = ? WHERE id = ?",
+            (utc_now(), utc_now(), appointment_id),
+        )
+
+
+def referral_code_for_user(user_id: int) -> str:
+    with db_connect() as connection:
+        row = connection.execute(
+            "SELECT code FROM referral_codes WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is not None:
+            return str(row["code"])
+        code = f"ZETTA{user_id}"
+        connection.execute(
+            "INSERT INTO referral_codes (user_id, code, created_at) VALUES (?, ?, ?)",
+            (user_id, code, utc_now()),
+        )
+        return code
+
+
+def apply_referral_code(referred_user_id: int, code: str) -> bool:
+    code = code.strip().upper()
+    with db_connect() as connection:
+        owner = connection.execute(
+            "SELECT user_id FROM referral_codes WHERE code = ?",
+            (code,),
+        ).fetchone()
+        if owner is None or int(owner["user_id"]) == referred_user_id:
+            return False
+        try:
+            connection.execute(
+                """
+                INSERT INTO referrals (referrer_user_id, referred_user_id, code, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(owner["user_id"]), referred_user_id, code, utc_now()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True
+
+
+def referral_stats(user_id: int) -> tuple[int, int]:
+    with db_connect() as connection:
+        total = connection.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_user_id = ?",
+            (user_id,),
+        ).fetchone()[0]
+        rewarded = connection.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_user_id = ? AND rewarded = 1",
+            (user_id,),
+        ).fetchone()[0]
+        return int(total), int(rewarded)
+
+
+def reward_referral_for_user(referred_user_id: int) -> int | None:
+    with db_connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id, referrer_user_id FROM referrals
+            WHERE referred_user_id = ? AND rewarded = 0
+            """,
+            (referred_user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute(
+            "UPDATE referrals SET rewarded = 1 WHERE id = ?",
+            (row["id"],),
+        )
+        return int(row["referrer_user_id"])
+
+
+def configured_admin_roles() -> dict[int, str]:
+    roles: dict[int, str] = {}
+    for admin_id in admin_chat_ids():
+        roles[admin_id] = "super_admin"
+    raw_roles = os.getenv("ADMIN_ROLES", "")
+    for item in raw_roles.split(","):
+        if ":" not in item:
+            continue
+        user_id, role = item.split(":", 1)
+        if user_id.strip().isdigit():
+            roles[int(user_id.strip())] = role.strip()
+    with db_connect() as connection:
+        rows = connection.execute("SELECT user_id, role FROM admin_roles").fetchall()
+    for row in rows:
+        roles[int(row["user_id"])] = str(row["role"])
+    return roles
+
+
+def admin_role(user_id: int) -> str:
+    return configured_admin_roles().get(user_id, "")
+
+
+def set_admin_role(user_id: int, role: str, updated_by: int) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO admin_roles (user_id, role, updated_by, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                role = excluded.role,
+                updated_by = excluded.updated_by,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, role, updated_by, utc_now()),
+        )
+
+
+def has_permission(user_id: int, permission: str) -> bool:
+    role = admin_role(user_id)
+    permissions = {
+        "super_admin": {"all"},
+        "sales": {"orders", "support", "meeting", "broadcast", "report"},
+        "developer": {"orders", "task", "report"},
+        "payment": {"orders", "payment"},
+    }
+    allowed = permissions.get(role, set())
+    return "all" in allowed or permission in allowed
+
+
+def get_system_state(key: str, default: str = "") -> str:
+    with db_connect() as connection:
+        row = connection.execute(
+            "SELECT value FROM system_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return str(row["value"]) if row is not None else default
+
+
+def set_system_state(key: str, value: str) -> None:
+    with db_connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO system_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, utc_now()),
+        )
 
 
 def order_stats() -> tuple[int, int, list[sqlite3.Row]]:
@@ -809,6 +1369,10 @@ def user_help_text() -> str:
         "/contact - admin bilan aloqa\n"
         "/status - oxirgi buyurtma holati\n"
         "/invoice - oxirgi buyurtma invoice PDF\n"
+        "/support MATN - support murojaati\n"
+        "/meeting YYYY-MM-DD HH:MM - uchrashuv so'rash\n"
+        "/referral - referral kodingiz\n"
+        "/ref KOD - referral kodni ishlatish\n"
         "/faq - ko'p beriladigan savollar\n"
         "/promo PROMOKOD - promo kod kiritish\n"
         "/help - yordam\n"
@@ -832,16 +1396,27 @@ def admin_help_text() -> str:
         "/stage ID BOSQICH - CRM bosqichini o'zgartirish\n"
         "/task ID matn - buyurtmaga vazifa qo'shish\n"
         "/tasks ID - vazifalar ro'yxati\n"
+        "/files ID - loyiha fayllarini olish\n"
         "/done TASK_ID - vazifani yopish\n"
         "/deadline ID YYYY-MM-DD - deadline qo'yish\n"
         "/assign ID ism - mas'ul biriktirish\n"
         "/web - web admin panel havolasi\n"
+        "/audit [ID] - audit log\n"
+        "/tickets - support ticketlar\n"
+        "/reply TICKET_ID matn - ticketga javob\n"
+        "/closeticket ID - ticketni yopish\n"
+        "/meetings - uchrashuvlar\n"
+        "/confirmmeeting ID - uchrashuvni tasdiqlash\n"
+        "/role USER_ID ROLE - admin rol berish\n"
+        "/admins - admin rollari\n"
+        "/aireport - AI savdo hisoboti\n"
+        "/health - monitoring holati\n"
         "/export - buyurtmalarni CSV qilish\n"
         "/broadcast matn - hammaga xabar yuborish\n"
         "/block USER_ID sabab - foydalanuvchini bloklash\n"
         "/unblock USER_ID - blokdan chiqarish\n"
         "/backup - database backup faylini olish\n\n"
-        "User commandlar ham ishlaydi: /start, /prices, /portfolio, /contact, /status, /invoice, /faq, /promo, /help, /cancel."
+        "User commandlar ham ishlaydi: /start, /prices, /portfolio, /contact, /status, /invoice, /support, /meeting, /referral, /ref, /faq, /promo, /help, /cancel."
     )
 
 
@@ -854,6 +1429,10 @@ def user_bot_commands() -> list[BotCommand]:
         BotCommand(command="contact", description="Admin bilan aloqa"),
         BotCommand(command="status", description="Buyurtma holati"),
         BotCommand(command="invoice", description="Invoice PDF"),
+        BotCommand(command="support", description="Support murojaati"),
+        BotCommand(command="meeting", description="Uchrashuv so'rash"),
+        BotCommand(command="referral", description="Referral kod"),
+        BotCommand(command="ref", description="Referral kod ishlatish"),
         BotCommand(command="faq", description="Savol-javob"),
         BotCommand(command="promo", description="Promo kod kiritish"),
         BotCommand(command="help", description="Yordam"),
@@ -874,10 +1453,21 @@ def admin_bot_commands() -> list[BotCommand]:
         BotCommand(command="stage", description="CRM bosqich"),
         BotCommand(command="task", description="Vazifa qo'shish"),
         BotCommand(command="tasks", description="Vazifalar"),
+        BotCommand(command="files", description="Loyiha fayllari"),
         BotCommand(command="done", description="Vazifani yopish"),
         BotCommand(command="deadline", description="Deadline"),
         BotCommand(command="assign", description="Mas'ul"),
         BotCommand(command="web", description="Web admin panel"),
+        BotCommand(command="audit", description="Audit log"),
+        BotCommand(command="tickets", description="Support ticketlar"),
+        BotCommand(command="reply", description="Ticketga javob"),
+        BotCommand(command="closeticket", description="Ticketni yopish"),
+        BotCommand(command="meetings", description="Uchrashuvlar"),
+        BotCommand(command="confirmmeeting", description="Uchrashuvni tasdiqlash"),
+        BotCommand(command="role", description="Admin rol"),
+        BotCommand(command="admins", description="Adminlar"),
+        BotCommand(command="aireport", description="AI savdo hisoboti"),
+        BotCommand(command="health", description="Monitoring"),
         BotCommand(command="export", description="CSV export"),
         BotCommand(command="broadcast", description="Hammaga xabar"),
         BotCommand(command="block", description="User bloklash"),
@@ -894,7 +1484,7 @@ def admin_bot_commands() -> list[BotCommand]:
 async def setup_bot_commands(bot: Bot) -> None:
     try:
         await bot.set_my_commands(user_bot_commands(), scope=BotCommandScopeDefault())
-        for admin_id in admin_chat_ids():
+        for admin_id in configured_admin_roles():
             await bot.set_my_commands(admin_bot_commands(), scope=BotCommandScopeChat(chat_id=admin_id))
     except Exception as exc:
         logging.warning("Bot command menyusini sozlab bo'lmadi: %s", exc)
@@ -921,7 +1511,7 @@ async def setup_menu_button(bot: Bot) -> None:
             web_app=WebAppInfo(url=url),
         )
         await bot.set_chat_menu_button(menu_button=menu_button)
-        for admin_id in admin_chat_ids():
+        for admin_id in configured_admin_roles():
             await bot.set_chat_menu_button(chat_id=admin_id, menu_button=menu_button)
         logging.info("Telegram Menu Web App sozlandi: %s", url)
     except Exception as exc:
@@ -929,7 +1519,7 @@ async def setup_menu_button(bot: Bot) -> None:
 
 
 def is_admin_user(user_id: int) -> bool:
-    return user_id in admin_chat_ids()
+    return bool(admin_role(user_id))
 
 
 def is_rate_limited(user_id: int) -> bool:
@@ -1402,6 +1992,46 @@ async def groq_json(
     data = json.loads(response_text)
     content = data["choices"][0]["message"]["content"]
     return parse_json_object(content)
+
+
+async def transcribe_voice(bot: Bot, file_id: str) -> str:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("Ovozli xabar uchun GROQ_API_KEY sozlanmagan.")
+
+    telegram_file = await bot.get_file(file_id)
+    if not telegram_file.file_path:
+        raise RuntimeError("Telegram ovoz fayli topilmadi.")
+
+    buffer = io.BytesIO()
+    await bot.download_file(telegram_file.file_path, destination=buffer)
+    buffer.seek(0)
+
+    form = aiohttp.FormData()
+    form.add_field(
+        "file",
+        buffer.getvalue(),
+        filename="voice.ogg",
+        content_type="audio/ogg",
+    )
+    form.add_field("model", os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"))
+    form.add_field("language", "uz")
+    form.add_field("response_format", "json")
+
+    timeout = aiohttp.ClientTimeout(total=90)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with aiohttp.ClientSession(timeout=timeout) as client:
+        async with client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers=headers,
+            data=form,
+        ) as response:
+            response_text = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(f"Ovoz tahlili xatosi {response.status}: {response_text[:160]}")
+
+    data = json.loads(response_text)
+    return str(data.get("text") or "").strip()
 
 
 async def estimate_with_ai(session: UserSession) -> EstimateResult:
@@ -2082,6 +2712,12 @@ def format_order_detail(order: sqlite3.Row) -> str:
         if tasks
         else "-"
     )
+    files = order_files(order["id"])
+    files_text = (
+        "\n".join(f"- {item['file_name'] or item['file_type']}" for item in files[:10])
+        if files
+        else "-"
+    )
     return (
         f"Buyurtma #{order['id']}\n\n"
         f"Holat: {status}\n"
@@ -2098,6 +2734,7 @@ def format_order_detail(order: sqlite3.Row) -> str:
         f"50% predoplata: ${order['prepayment']}\n\n"
         f"{ai_label}: {order['ai_summary']}\n"
         f"Asosiy bandlar:\n{feature_text}\n\n"
+        f"Biriktirilgan fayllar:\n{files_text}\n\n"
         f"Tasklar:\n{tasks_text}\n\n"
         f"Admin izohlari:\n{notes_text}\n\n"
         f"Talablar:\n{order['requirements']}"
@@ -2140,6 +2777,96 @@ def ai_status_text() -> str:
     model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
     status = "ulangan" if api_key else "ulanmagan"
     return f"AI holati: {status}\nModel: {model}"
+
+
+def fallback_sales_report() -> str:
+    total, paid_sum, statuses = order_stats()
+    pipelines = pipeline_stats()
+    with db_connect() as connection:
+        leads = connection.execute(
+            """
+            SELECT lead_score, COUNT(*) AS count
+            FROM orders
+            GROUP BY lead_score
+            ORDER BY count DESC
+            """
+        ).fetchall()
+        recent_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM orders WHERE created_at >= ?",
+                ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="seconds"),),
+            ).fetchone()[0]
+        )
+
+    status_text = ", ".join(
+        f"{STATUS_LABELS.get(row['status'], row['status'])}: {row['count']}" for row in statuses
+    ) or "ma'lumot yo'q"
+    pipeline_text = ", ".join(
+        f"{PIPELINE_STAGES.get(row['pipeline_stage'], row['pipeline_stage'])}: {row['count']}"
+        for row in pipelines
+    ) or "ma'lumot yo'q"
+    lead_text = ", ".join(
+        f"{row['lead_score'] or 'Aniqlanmagan'}: {row['count']}" for row in leads
+    ) or "ma'lumot yo'q"
+    return (
+        "AI savdo hisoboti:\n\n"
+        f"Jami buyurtma: {total}\n"
+        f"Oxirgi 7 kun: {recent_count}\n"
+        f"Tasdiqlangan loyihalar qiymati: ${paid_sum}\n"
+        f"Holatlar: {status_text}\n"
+        f"CRM pipeline: {pipeline_text}\n"
+        f"Leadlar: {lead_text}\n\n"
+        "Tavsiya: narx olgan, ammo predoplata qilmagan mijozlar bilan qayta bog'laning; "
+        "issiq leadlarni birinchi navbatda ko'rib chiqing."
+    )
+
+
+async def ai_sales_report() -> str:
+    fallback = fallback_sales_report()
+    if not os.getenv("GROQ_API_KEY"):
+        return fallback
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Sen ZettaCode Tech savdo analitigi bo'lib ishlaysan. Berilgan statistikani o'zbek tilida "
+                "qisqa tahlil qil, muammolarni va 3 ta amaliy tavsiyani yoz. Hech qanday yangi raqam o'ylab topma. "
+                "Javob faqat JSON bo'lsin: {\"report\": string}"
+            ),
+        },
+        {"role": "user", "content": fallback},
+    ]
+    try:
+        parsed = await groq_json(messages, max_tokens=700, temperature=0.15)
+        report = str(parsed.get("report") or "").strip()
+        return report or fallback
+    except Exception as exc:
+        logging.warning("AI savdo hisoboti yaratilmadi: %s", exc)
+        return fallback
+
+
+def health_text() -> str:
+    database_status = "ishlayapti"
+    try:
+        with db_connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+    except Exception as exc:
+        database_status = f"xato: {exc}"
+
+    uptime = datetime.now(timezone.utc) - BOT_STARTED_AT
+    total_seconds = max(0, int(uptime.total_seconds()))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    heartbeat = get_system_state("monitor_heartbeat", "hali yozilmagan")
+    return (
+        "Bot monitoring holati:\n\n"
+        f"Bot: ishlayapti\n"
+        f"Database: {database_status}\n"
+        f"AI: {'ulangan' if os.getenv('GROQ_API_KEY') else 'ulanmagan'}\n"
+        f"Uptime: {hours} soat {minutes} daqiqa {seconds} soniya\n"
+        f"Oxirgi heartbeat: {heartbeat}"
+    )
 
 
 def fallback_technical_draft(order: sqlite3.Row) -> str:
@@ -2259,7 +2986,7 @@ async def notify_admins(
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    for admin_id in admin_chat_ids():
+    for admin_id in configured_admin_roles():
         try:
             await bot.send_message(admin_id, text, reply_markup=reply_markup)
         except Exception as exc:
@@ -2378,7 +3105,52 @@ async def reminder_loop(bot: Bot) -> None:
             except Exception as exc:
                 logging.warning("Reminder yuborilmadi: %s", exc)
 
+        for appointment in pending_appointment_reminders():
+            local_time = datetime.fromisoformat(appointment["scheduled_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
+            try:
+                await bot.send_message(
+                    appointment["user_id"],
+                    f"Eslatma: uchrashuvingiz #{appointment['id']} yaqinlashmoqda.\nVaqt: {local_time}",
+                )
+                await notify_admins(
+                    bot,
+                    f"Uchrashuv eslatmasi #{appointment['id']}\n"
+                    f"Mijoz: {appointment['full_name']}\nVaqt: {local_time}",
+                )
+                mark_appointment_reminded(appointment["id"])
+            except Exception as exc:
+                logging.warning("Uchrashuv eslatmasi yuborilmadi: %s", exc)
+
         await asyncio.sleep(3600)
+
+
+async def monitoring_loop(bot: Bot) -> None:
+    await asyncio.sleep(5)
+    while True:
+        try:
+            with db_connect() as connection:
+                connection.execute("SELECT 1").fetchone()
+            set_system_state("monitor_heartbeat", utc_now())
+
+            try:
+                report_hour = int(os.getenv("DAILY_REPORT_HOUR", "20"))
+            except ValueError:
+                report_hour = 20
+            report_hour = min(23, max(0, report_hour))
+            local_now = datetime.now().astimezone()
+            last_report_date = get_system_state("daily_report_date")
+            if local_now.hour >= report_hour and last_report_date != local_now.date().isoformat():
+                await notify_admins(bot, await ai_sales_report())
+                set_system_state("daily_report_date", local_now.date().isoformat())
+        except Exception as exc:
+            logging.exception("Monitoring tekshiruvi xatosi: %s", exc)
+            last_error = get_system_state("monitor_last_error")
+            error_key = f"{datetime.now(timezone.utc).date().isoformat()}:{type(exc).__name__}"
+            if last_error != error_key:
+                await notify_admins(bot, f"Bot monitoring xatosi: {type(exc).__name__}: {exc}")
+                set_system_state("monitor_last_error", error_key)
+
+        await asyncio.sleep(300)
 
 
 def web_admin_url() -> str:
@@ -2400,6 +3172,243 @@ def web_authorized(request: web.Request) -> bool:
     return request.query.get("token") == token
 
 
+def validate_telegram_init_data(init_data: str) -> dict[str, Any] | None:
+    bot_token = os.getenv("BOT_TOKEN", "")
+    if not bot_token or not init_data:
+        return None
+
+    values = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = values.pop("hash", "")
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{key}={values[key]}" for key in sorted(values))
+    secret_key = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
+    expected_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_hash, received_hash):
+        return None
+
+    try:
+        auth_date = int(values.get("auth_date", "0"))
+    except ValueError:
+        return None
+    try:
+        max_age = int(os.getenv("WEBAPP_AUTH_MAX_AGE", "86400"))
+    except ValueError:
+        max_age = 86400
+    if auth_date <= 0 or abs(int(time.time()) - auth_date) > max_age:
+        return None
+
+    try:
+        user_data = json.loads(values.get("user", "{}"))
+    except json.JSONDecodeError:
+        return None
+    return user_data if isinstance(user_data, dict) and user_data.get("id") else None
+
+
+def webapp_identity(payload: dict[str, Any], request: web.Request) -> tuple[int, str, str] | None:
+    user_data = validate_telegram_init_data(str(payload.get("init_data") or ""))
+    local_test_allowed = (
+        not os.getenv("PORT")
+        and os.getenv("WEBAPP_ALLOW_LOCAL_TEST", "1").strip().lower() not in {"0", "false", "yoq"}
+    )
+    if (
+        user_data is None
+        and local_test_allowed
+        and request.remote in {"127.0.0.1", "::1", "localhost"}
+    ):
+        fallback = payload.get("user")
+        if isinstance(fallback, dict) and fallback.get("id"):
+            user_data = fallback
+    if user_data is None:
+        return None
+
+    try:
+        user_id = int(user_data["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    first_name = str(user_data.get("first_name") or "").strip()
+    last_name = str(user_data.get("last_name") or "").strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part) or f"User {user_id}"
+    username = str(user_data.get("username") or "").strip().lstrip("@")
+    return user_id, full_name, username
+
+
+async def webapp_json(request: web.Request) -> dict[str, Any] | None:
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, web.HTTPBadRequest):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def portfolio_cases() -> list[dict[str, str]]:
+    return [
+        {
+            "title": "Restoran buyurtma boti",
+            "description": "Menyu, savatcha, naqd to'lov, filial va kurerga buyurtma uzatish oqimi.",
+        },
+        {
+            "title": "Kurer boshqaruv tizimi",
+            "description": "Buyurtmalarni kurerlarga biriktirish, statuslar va admin nazorati.",
+        },
+        {
+            "title": "Korporativ veb-sayt",
+            "description": "Xizmatlar katalogi, murojaat formasi, yangiliklar va boshqaruv paneli.",
+        },
+        {
+            "title": "Savdo CRM",
+            "description": "Mijozlar bazasi, lead pipeline, vazifalar, hisobot va xodim rollari.",
+        },
+        {
+            "title": "Mobil xizmat MVP",
+            "description": "Android/iOS mijoz profili, xizmat buyurtmasi, bildirishnomalar va API.",
+        },
+    ]
+
+
+async def webapp_order_api(request: web.Request) -> web.Response:
+    payload = await webapp_json(request)
+    if payload is None:
+        return web.json_response({"error": "Noto'g'ri JSON so'rov."}, status=400)
+    identity = webapp_identity(payload, request)
+    if identity is None:
+        return web.json_response({"error": "Telegram foydalanuvchisi tasdiqlanmadi."}, status=401)
+
+    project = str(payload.get("project") or "").strip()
+    requirements = str(payload.get("requirements") or "").strip()
+    user_id, full_name, username = identity
+    if is_blocked_user(user_id):
+        return web.json_response({"error": "Profilingiz vaqtincha bloklangan."}, status=403)
+
+    try:
+        project_key = normalize_project_key(project)
+        if project_key not in PROJECT_PRICES:
+            raise ValueError("Loyiha turi noto'g'ri.")
+        analysis_session = UserSession(
+            selected_projects={project_key},
+            requirements=normalize_payment_policy_text(requirements),
+        )
+        validation = await validate_requirements_with_ai(analysis_session)
+        if not validation.enough:
+            raise ValueError(validation.reply)
+        analysis = await estimate_with_ai(analysis_session)
+        track_web_user(user_id, full_name, username)
+        order = create_web_order(
+            user_id,
+            full_name,
+            username,
+            project_key,
+            requirements,
+            analysis=analysis,
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    bot: Bot = request.app["bot"]
+    session = reset_session(user_id)
+    session.stage = "payment_confirmation"
+    session.selected_projects = {project_key}
+    session.requirements = order["requirements"]
+    session.estimate = int(order["estimate"])
+    session.prepayment = int(order["prepayment"])
+    session.order_id = int(order["id"])
+    session.ai_summary = str(order["ai_summary"])
+    session.ai_features = json.loads(order["ai_features"] or "[]")
+    session.ai_used = bool(order["ai_used"])
+    session.estimated_duration = str(order["estimated_duration"])
+    session.lead_score = str(order["lead_score"])
+    try:
+        await bot.send_message(
+            user_id,
+            f"Web App buyurtmangiz #{order['id']} qabul qilindi.\n"
+            f"Loyiha: {projects_from_order(order)}\n"
+            f"Taxminiy narx: ${order['estimate']}\n"
+            f"Boshlash uchun 50% predoplata: ${order['prepayment']}\n\n"
+            "Loyiha boshlanishi uchun kelishilgan summaning yarmi (50% predoplata) "
+            "plastik karta orqali qabul qilinadi. To'lov qilishga rozimisiz?",
+            reply_markup=payment_keyboard(),
+        )
+    except Exception as exc:
+        logging.warning("Web App buyurtma xabari mijozga yuborilmadi: %s", exc)
+    await notify_admins(
+        bot,
+        f"Web App orqali yangi buyurtma #{order['id']}\n"
+        f"Mijoz: {full_name} (@{username or 'username yoq'})\n"
+        f"Loyiha: {projects_from_order(order)}\n"
+        f"Narx: ${order['estimate']}, predoplata: ${order['prepayment']}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Buyurtmani ko'rish", callback_data=f"panel:order:{order['id']}")]
+            ]
+        ),
+    )
+    return web.json_response(
+        {
+            "order_id": order["id"],
+            "estimate": order["estimate"],
+            "prepayment": order["prepayment"],
+            "duration": order["estimated_duration"],
+        }
+    )
+
+
+async def webapp_status_api(request: web.Request) -> web.Response:
+    payload = await webapp_json(request)
+    if payload is None:
+        return web.json_response({"error": "Noto'g'ri JSON so'rov."}, status=400)
+    identity = webapp_identity(payload, request)
+    if identity is None:
+        return web.json_response({"error": "Telegram foydalanuvchisi tasdiqlanmadi."}, status=401)
+    order = latest_order_for_user(identity[0])
+    if order is None:
+        return web.json_response({"order": None})
+    return web.json_response(
+        {
+            "order": {
+                "id": order["id"],
+                "project": projects_from_order(order),
+                "status": STATUS_LABELS.get(order["status"], order["status"]),
+                "pipeline": PIPELINE_STAGES.get(order["pipeline_stage"], order["pipeline_stage"]),
+                "estimate": order["estimate"],
+                "prepayment": order["prepayment"],
+                "duration": order["estimated_duration"],
+            }
+        }
+    )
+
+
+async def webapp_portfolio_api(request: web.Request) -> web.Response:
+    return web.json_response({"items": portfolio_cases()})
+
+
+async def webapp_support_api(request: web.Request) -> web.Response:
+    payload = await webapp_json(request)
+    if payload is None:
+        return web.json_response({"error": "Noto'g'ri JSON so'rov."}, status=400)
+    identity = webapp_identity(payload, request)
+    if identity is None:
+        return web.json_response({"error": "Telegram foydalanuvchisi tasdiqlanmadi."}, status=401)
+    message = str(payload.get("message") or "").strip()
+    if len(message) < 10:
+        return web.json_response({"error": "Murojaatni batafsilroq yozing."}, status=400)
+
+    user_id, full_name, username = identity
+    track_web_user(user_id, full_name, username)
+    ticket_id = create_web_support_ticket(user_id, full_name, username, message)
+    await notify_admins(
+        request.app["bot"],
+        f"Web App support ticket #{ticket_id}\n"
+        f"Mijoz: {full_name} (@{username or 'username yoq'})\n"
+        f"Xabar: {message}",
+    )
+    return web.json_response({"ticket_id": ticket_id})
+
+
 def web_layout(title: str, body: str) -> str:
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
@@ -2414,9 +3423,19 @@ def web_layout(title: str, body: str) -> str:
 
 
 async def web_app_page(request: web.Request) -> web.StreamResponse:
-    if os.path.exists(WEBAPP_HTML_PATH):
+    if WEBAPP_HTML_PATH.exists():
         return web.FileResponse(WEBAPP_HTML_PATH)
     return web.Response(text="Web app sahifasi topilmadi", status=404)
+
+
+async def webapp_static(request: web.Request) -> web.StreamResponse:
+    filename = request.match_info["filename"]
+    if filename not in {"styles.css", "app.js"}:
+        return web.Response(text="Not found", status=404)
+    path = WEBAPP_ROOT / filename
+    if not path.exists():
+        return web.Response(text="Not found", status=404)
+    return web.FileResponse(path)
 
 
 async def web_index(request: web.Request) -> web.Response:
@@ -2461,14 +3480,21 @@ async def web_order_detail(request: web.Request) -> web.Response:
     return web.Response(text=web_layout(f"Buyurtma #{order_id}", body), content_type="text/html")
 
 
-async def start_web_admin() -> web.AppRunner | None:
+async def start_web_admin(bot: Bot) -> web.AppRunner | None:
     railway_port = os.getenv("PORT")
     admin_enabled = os.getenv("WEB_ADMIN_ENABLED", "1").strip() not in {"0", "false", "False", "yoq"}
     # Railway (PORT mavjud) bo'lsa web app sahifasi uchun server doim ishlaydi.
     if not railway_port and not admin_enabled:
         return None
     app = web.Application()
+    app["bot"] = bot
     app.router.add_get("/", web_app_page)
+    app.router.add_get("/app", web_app_page)
+    app.router.add_get("/app/{filename}", webapp_static)
+    app.router.add_post("/api/webapp/order", webapp_order_api)
+    app.router.add_post("/api/webapp/status", webapp_status_api)
+    app.router.add_get("/api/webapp/portfolio", webapp_portfolio_api)
+    app.router.add_post("/api/webapp/support", webapp_support_api)
     if admin_enabled:
         app.router.add_get("/admin", web_index)
         app.router.add_get("/admin/order/{order_id}", web_order_detail)
@@ -2557,6 +3583,7 @@ async def finalize_estimate(message: Message, user: User, session: UserSession, 
     session.lead_score = lead_score_label(session, session.estimate)
     if session.order_id is None:
         session.order_id = create_order(user, session)
+        attach_pending_files(user.id, session.order_id)
     else:
         update_order_price(session.order_id, session.estimate, session.prepayment)
         update_order_metadata(
@@ -2605,6 +3632,59 @@ async def finalize_estimate(message: Message, user: User, session: UserSession, 
         )
 
 
+async def process_customer_project_text(
+    message: Message,
+    text: str,
+    session: UserSession,
+    bot: Bot,
+) -> None:
+    await message.answer("Xabaringiz AI orqali tekshirilyapti...")
+    result = await guide_conversation_with_ai(session, text)
+
+    if not result.relevant:
+        session.off_topic_count += 1
+        await message.answer(
+            result.reply,
+            reply_markup=requirements_keyboard(bool(session.requirements))
+            if session.stage == "collect_requirements"
+            else welcome_inline_keyboard(),
+        )
+        return
+
+    for project_key in result.suggested_projects:
+        session.selected_projects.add(project_key)
+
+    if not session.selected_projects:
+        await message.answer(
+            result.reply or "Qaysi loyiha turini tanlaysiz?",
+            reply_markup=project_keyboard(session.selected_projects),
+        )
+        return
+
+    captured_requirements = result.captured_requirements or text
+    add_requirements_text(session, captured_requirements)
+    if has_online_payment_request(text):
+        await message.answer(
+            "Loyihangiz ichidagi to'lov funksiyasi uchun Click, Payme, Paynet, karta va boshqa online to'lov integratsiyalariga ruxsat berilmaydi. "
+            "Bu funksiya faqat naqd to'lov siyosati bilan qabul qilinadi."
+        )
+
+    validation = await validate_requirements_with_ai(session)
+    if not validation.enough:
+        session.requirements_validated = False
+        session.asked_questions += 1
+        await message.answer(validation.reply, reply_markup=requirements_reply_keyboard())
+        await message.answer(
+            f"Tanlangan yo'nalish: {selected_project_titles(session)}\n"
+            "Talablar hali yetarli emas. Yuqoridagi savollarga javob yozing.",
+            reply_markup=requirements_keyboard(has_requirements=False),
+        )
+        return
+
+    session.requirements_validated = True
+    await finalize_estimate(message, message.from_user, session, bot=bot)
+
+
 async def send_payment_details(message: Message, session: UserSession) -> None:
     card_number = os.getenv("CARD_NUMBER", "[Karta raqami]")
     card_holder = os.getenv("CARD_HOLDER", "TOSHMIRZA YUSUPOV")
@@ -2634,15 +3714,21 @@ async def main() -> None:
     dp.callback_query.middleware(security_middleware)
     await setup_bot_commands(bot)
     await setup_menu_button(bot)
-    web_runner = await start_web_admin()
+    web_runner = await start_web_admin(bot)
     reminder_task = asyncio.create_task(reminder_loop(bot))
+    monitor_task = asyncio.create_task(monitoring_loop(bot))
+    await notify_admins(bot, "ZettaCode Tech bot ishga tushdi.\n\n" + health_text())
 
     @dp.message(CommandStart())
     async def start_handler(message: Message) -> None:
         if is_admin_user(message.from_user.id):
             await show_admin_panel(message)
             return
-        reset_session(message.from_user.id)
+        session = reset_session(message.from_user.id)
+        start_args = command_args(message)
+        if start_args.startswith("ref_") and apply_referral_code(message.from_user.id, start_args[4:]):
+            set_session_promo(session, "START5")
+            await message.answer("Referral havola qabul qilindi. 5% promo faollashdi.")
         await show_main_menu(message, user_id=message.from_user.id)
 
     @dp.message(Command("admin"))
@@ -2693,6 +3779,73 @@ async def main() -> None:
             await message.answer("Invoice uchun buyurtma topilmadi.")
             return
         await send_invoice_pdf(message, order)
+
+    @dp.message(Command("support"))
+    async def support_handler(message: Message) -> None:
+        text = command_args(message)
+        if not text:
+            session = get_session(message.from_user.id)
+            session.stage = "support_message"
+            await message.answer("Support murojaatingizni batafsil yozing.")
+            return
+        ticket_id = create_support_ticket(message.from_user, text)
+        await message.answer(f"Support murojaatingiz qabul qilindi. Ticket #{ticket_id}.")
+        await notify_admins(
+            bot,
+            f"Yangi support ticket #{ticket_id}\n"
+            f"Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'username yoq'})\n"
+            f"Xabar: {text}",
+        )
+
+    @dp.message(Command("meeting"))
+    async def meeting_handler(message: Message) -> None:
+        value = command_args(message)
+        try:
+            local_datetime = datetime.strptime(value, "%Y-%m-%d %H:%M")
+            local_timezone = datetime.now().astimezone().tzinfo
+            scheduled = local_datetime.replace(tzinfo=local_timezone).astimezone(timezone.utc)
+        except ValueError:
+            await message.answer("Uchrashuv formati: /meeting YYYY-MM-DD HH:MM")
+            return
+        if scheduled <= datetime.now(timezone.utc):
+            await message.answer("Uchrashuv vaqti kelajakda bo'lishi kerak.")
+            return
+        appointment_id = create_appointment(message.from_user, scheduled.isoformat())
+        await message.answer(
+            f"Uchrashuv so'rovi qabul qilindi: #{appointment_id}\n"
+            f"Vaqt: {value}\nAdmin tasdiqlashini kuting."
+        )
+        await notify_admins(
+            bot,
+            f"Yangi uchrashuv so'rovi #{appointment_id}\n"
+            f"Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'username yoq'})\n"
+            f"Vaqt: {value}",
+        )
+
+    @dp.message(Command("referral"))
+    async def referral_handler(message: Message) -> None:
+        code = referral_code_for_user(message.from_user.id)
+        total, rewarded = referral_stats(message.from_user.id)
+        me = await bot.get_me()
+        await message.answer(
+            f"Referral kodingiz: {code}\n"
+            f"Havola: https://t.me/{me.username}?start=ref_{code}\n"
+            f"Taklif qilinganlar: {total}\n"
+            f"Mukofotlanganlar: {rewarded}"
+        )
+
+    @dp.message(Command("ref"))
+    async def ref_handler(message: Message) -> None:
+        code = command_args(message)
+        if not code:
+            await message.answer("Referral kodni shunday yuboring: /ref ZETTA123")
+            return
+        if not apply_referral_code(message.from_user.id, code):
+            await message.answer("Referral kod noto'g'ri, o'zingizniki yoki avval ishlatilgan.")
+            return
+        session = get_session(message.from_user.id)
+        set_session_promo(session, "START5")
+        await message.answer("Referral kod qabul qilindi. Keyingi hisoblash uchun 5% promo faollashdi.")
 
     @dp.message(Command("faq"))
     async def faq_handler(message: Message) -> None:
@@ -2764,6 +3917,21 @@ async def main() -> None:
             return
         await message.answer(ai_status_text(), reply_markup=admin_panel_keyboard())
 
+    @dp.message(Command("aireport"))
+    async def ai_report_handler(message: Message) -> None:
+        if not has_permission(message.from_user.id, "report"):
+            await message.answer("Bu command uchun hisobot ruxsati kerak.")
+            return
+        await message.answer("AI savdo hisoboti tayyorlanyapti...")
+        await send_long_message(message, await ai_sales_report())
+
+    @dp.message(Command("health"))
+    async def health_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        await message.answer(health_text(), reply_markup=admin_panel_keyboard())
+
     @dp.message(Command("testorder"))
     async def test_order_handler(message: Message) -> None:
         if not is_admin_user(message.from_user.id):
@@ -2808,6 +3976,7 @@ async def main() -> None:
         if not add_order_note(order_id, message.from_user.id, note):
             await message.answer("Buyurtma topilmadi.")
             return
+        log_audit(message.from_user.id, "note_add", "order", order_id, note)
         await message.answer(f"Buyurtma #{order_id} uchun izoh saqlandi.")
 
     @dp.message(Command("draft"))
@@ -2840,6 +4009,7 @@ async def main() -> None:
             await message.answer("Buyurtma topilmadi.")
             return
         update_order_metadata(order_id, pipeline_stage=args[1])
+        log_audit(message.from_user.id, "pipeline_change", "order", order_id, args[1])
         await message.answer(f"Buyurtma #{order_id} CRM bosqichi: {PIPELINE_STAGES[args[1]]}")
 
     @dp.message(Command("task"))
@@ -2855,6 +4025,7 @@ async def main() -> None:
         if not add_order_task(order_id, args[1]):
             await message.answer("Buyurtma topilmadi.")
             return
+        log_audit(message.from_user.id, "task_add", "order", order_id, args[1])
         await message.answer(f"Buyurtma #{order_id} uchun vazifa qo'shildi.")
 
     @dp.message(Command("tasks"))
@@ -2868,6 +4039,25 @@ async def main() -> None:
             return
         await message.answer(format_tasks_text(int(order_id_text), include_done=True))
 
+    @dp.message(Command("files"))
+    async def files_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        order_id_text = command_args(message)
+        if not order_id_text.isdigit():
+            await message.answer("Fayllar: /files BUYURTMA_ID")
+            return
+        files = order_files(int(order_id_text))
+        if not files:
+            await message.answer("Bu buyurtmada fayllar yo'q.")
+            return
+        for item in files:
+            if item["file_type"] == "photo":
+                await message.answer_photo(item["file_id"], caption=item["file_name"] or "Loyiha rasmi")
+            else:
+                await message.answer_document(item["file_id"], caption=item["file_name"] or "Loyiha fayli")
+
     @dp.message(Command("done"))
     async def done_task_handler(message: Message) -> None:
         if not is_admin_user(message.from_user.id):
@@ -2880,6 +4070,7 @@ async def main() -> None:
         if not mark_task_done(int(task_id_text)):
             await message.answer("Vazifa topilmadi.")
             return
+        log_audit(message.from_user.id, "task_done", "task", int(task_id_text))
         await message.answer(f"Vazifa #{task_id_text} bajarildi deb belgilandi.")
 
     @dp.message(Command("deadline"))
@@ -2899,6 +4090,7 @@ async def main() -> None:
             await message.answer("Buyurtma topilmadi.")
             return
         update_order_metadata(order_id, deadline=args[1])
+        log_audit(message.from_user.id, "deadline_set", "order", order_id, args[1])
         await message.answer(f"Buyurtma #{order_id} deadline: {args[1]}")
 
     @dp.message(Command("assign"))
@@ -2915,6 +4107,7 @@ async def main() -> None:
             await message.answer("Buyurtma topilmadi.")
             return
         update_order_metadata(order_id, assignee=args[1])
+        log_audit(message.from_user.id, "assignee_set", "order", order_id, args[1])
         await message.answer(f"Buyurtma #{order_id} mas'ul: {args[1]}")
 
     @dp.message(Command("web"))
@@ -2923,6 +4116,138 @@ async def main() -> None:
             await message.answer("Bu command faqat admin uchun.")
             return
         await message.answer(f"Web admin panel:\n{web_admin_url()}")
+
+    @dp.message(Command("audit"))
+    async def audit_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        order_id_text = command_args(message)
+        order_id = int(order_id_text) if order_id_text.isdigit() else None
+        rows = latest_audit_logs(order_id=order_id)
+        if not rows:
+            await message.answer("Audit yozuvlari topilmadi.")
+            return
+        lines = ["Audit log:"]
+        lines.extend(
+            f"#{row['id']} | admin {row['admin_id']} | {row['action']} | "
+            f"{row['entity_type']}:{row['entity_id'] or '-'} | {row['details']}"
+            for row in rows
+        )
+        await send_long_message(message, "\n".join(lines))
+
+    @dp.message(Command("tickets"))
+    async def tickets_handler(message: Message) -> None:
+        if not has_permission(message.from_user.id, "support"):
+            await message.answer("Bu command uchun support ruxsati kerak.")
+            return
+        rows = latest_support_tickets(command_args(message) or "open")
+        if not rows:
+            await message.answer("Support ticketlar topilmadi.")
+            return
+        lines = ["Support ticketlar:"]
+        lines.extend(
+            f"#{row['id']} | {row['status']} | {row['full_name']} (@{row['username'] or 'username yoq'})\n"
+            f"{row['message'][:180]}"
+            for row in rows
+        )
+        await send_long_message(message, "\n\n".join(lines))
+
+    @dp.message(Command("reply"))
+    async def reply_ticket_handler(message: Message) -> None:
+        if not has_permission(message.from_user.id, "support"):
+            await message.answer("Bu command uchun support ruxsati kerak.")
+            return
+        args = command_args(message).split(maxsplit=1)
+        if len(args) != 2 or not args[0].isdigit():
+            await message.answer("Ticketga javob: /reply TICKET_ID javob matni")
+            return
+        ticket = reply_support_ticket(int(args[0]), args[1])
+        if ticket is None:
+            await message.answer("Ticket topilmadi.")
+            return
+        await bot.send_message(
+            ticket["user_id"],
+            f"Support ticket #{ticket['id']} javobi:\n\n{args[1]}",
+        )
+        log_audit(message.from_user.id, "ticket_reply", "ticket", ticket["id"], args[1])
+        await message.answer(f"Ticket #{ticket['id']}ga javob yuborildi.")
+
+    @dp.message(Command("closeticket"))
+    async def close_ticket_handler(message: Message) -> None:
+        if not has_permission(message.from_user.id, "support"):
+            await message.answer("Bu command uchun support ruxsati kerak.")
+            return
+        ticket_id_text = command_args(message)
+        if not ticket_id_text.isdigit() or not close_support_ticket(int(ticket_id_text)):
+            await message.answer("Ticket topilmadi.")
+            return
+        log_audit(message.from_user.id, "ticket_close", "ticket", int(ticket_id_text))
+        await message.answer(f"Ticket #{ticket_id_text} yopildi.")
+
+    @dp.message(Command("meetings"))
+    async def meetings_handler(message: Message) -> None:
+        if not has_permission(message.from_user.id, "meeting"):
+            await message.answer("Bu command uchun meeting ruxsati kerak.")
+            return
+        rows = latest_appointments(command_args(message) or "pending")
+        if not rows:
+            await message.answer("Uchrashuvlar topilmadi.")
+            return
+        lines = ["Uchrashuvlar:"]
+        for row in rows:
+            local_time = datetime.fromisoformat(row["scheduled_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
+            lines.append(
+                f"#{row['id']} | {row['status']} | {local_time} | "
+                f"{row['full_name']} (@{row['username'] or 'username yoq'})"
+            )
+        await message.answer("\n".join(lines))
+
+    @dp.message(Command("confirmmeeting"))
+    async def confirm_meeting_handler(message: Message) -> None:
+        if not has_permission(message.from_user.id, "meeting"):
+            await message.answer("Bu command uchun meeting ruxsati kerak.")
+            return
+        appointment_id_text = command_args(message)
+        if not appointment_id_text.isdigit():
+            await message.answer("Tasdiqlash: /confirmmeeting ID")
+            return
+        appointment = update_appointment_status(int(appointment_id_text), "confirmed")
+        if appointment is None:
+            await message.answer("Uchrashuv topilmadi.")
+            return
+        local_time = datetime.fromisoformat(appointment["scheduled_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
+        await bot.send_message(
+            appointment["user_id"],
+            f"Uchrashuv #{appointment['id']} tasdiqlandi.\nVaqt: {local_time}",
+        )
+        log_audit(message.from_user.id, "meeting_confirm", "appointment", appointment["id"])
+        await message.answer(f"Uchrashuv #{appointment['id']} tasdiqlandi.")
+
+    @dp.message(Command("role"))
+    async def role_handler(message: Message) -> None:
+        if admin_role(message.from_user.id) != "super_admin":
+            await message.answer("Faqat super admin rol bera oladi.")
+            return
+        args = command_args(message).split(maxsplit=1)
+        allowed_roles = {"super_admin", "sales", "developer", "payment"}
+        if len(args) != 2 or not args[0].isdigit() or args[1] not in allowed_roles:
+            await message.answer("Rol berish: /role USER_ID super_admin|sales|developer|payment")
+            return
+        set_admin_role(int(args[0]), args[1], message.from_user.id)
+        log_audit(message.from_user.id, "role_set", "admin", int(args[0]), args[1])
+        await setup_bot_commands(bot)
+        await message.answer(f"User {args[0]} uchun rol: {args[1]}")
+
+    @dp.message(Command("admins"))
+    async def admins_handler(message: Message) -> None:
+        if not is_admin_user(message.from_user.id):
+            await message.answer("Bu command faqat admin uchun.")
+            return
+        roles = configured_admin_roles()
+        lines = ["Admin rollari:"]
+        lines.extend(f"- {user_id}: {role}" for user_id, role in roles.items())
+        await message.answer("\n".join(lines))
 
     @dp.message(Command("export"))
     async def export_handler(message: Message) -> None:
@@ -2972,6 +4297,7 @@ async def main() -> None:
             await message.answer("Adminni bloklab bo'lmaydi.")
             return
         block_user(user_id, parts[1] if len(parts) == 2 else "")
+        log_audit(message.from_user.id, "user_block", "user", user_id, parts[1] if len(parts) == 2 else "")
         await message.answer(f"User {user_id} bloklandi.")
 
     @dp.message(Command("unblock"))
@@ -2984,6 +4310,7 @@ async def main() -> None:
             await message.answer("Blokdan chiqarish: /unblock USER_ID")
             return
         unblock_user(int(user_id_text))
+        log_audit(message.from_user.id, "user_unblock", "user", int(user_id_text))
         await message.answer(f"User {user_id_text} blokdan chiqarildi.")
 
     @dp.callback_query(F.data.startswith("menu:"))
@@ -3162,6 +4489,7 @@ async def main() -> None:
                 await callback.answer("Buyurtma topilmadi.", show_alert=True)
                 return
             update_order_metadata(order_id, pipeline_stage=stage)
+            log_audit(callback.from_user.id, "pipeline_change", "order", order_id, stage)
             order = get_order(order_id)
             await safe_edit_or_answer(
                 callback,
@@ -3237,6 +4565,7 @@ async def main() -> None:
             session.stage = "choose_project"
             await callback.message.answer("Broadcast yuborilyapti...")
             await broadcast_to_users(bot, callback.message, text)
+            log_audit(callback.from_user.id, "broadcast_send", "broadcast", None, text[:200])
             await callback.answer()
             return
 
@@ -3376,12 +4705,72 @@ async def main() -> None:
 
         await callback.answer()
 
+    @dp.message(F.voice)
+    async def voice_handler(message: Message) -> None:
+        session = get_session(message.from_user.id)
+        if is_admin_user(message.from_user.id) and not session.is_admin_test:
+            await show_admin_panel(message)
+            return
+        if session.stage not in ("choose_project", "collect_requirements"):
+            await message.answer("Ovozli talab yuborish uchun avval /new orqali buyurtma boshlang.")
+            return
+        await message.answer("Ovozli xabaringiz matnga aylantirilyapti...")
+        try:
+            text = await transcribe_voice(bot, message.voice.file_id)
+        except Exception as exc:
+            logging.warning("Ovozli xabar tahlil qilinmadi: %s", exc)
+            await message.answer("Ovozli xabarni tushunib bo'lmadi. Iltimos, qayta yuboring yoki matn yozing.")
+            return
+        if not text:
+            await message.answer("Ovozli xabarda matn topilmadi.")
+            return
+        await message.answer(f"Ovozdan olingan matn:\n{text}")
+        await process_customer_project_text(message, text, session, bot)
+
+    @dp.message(F.document)
+    async def document_handler(message: Message) -> None:
+        session = get_session(message.from_user.id)
+        if is_admin_user(message.from_user.id) and not session.is_admin_test:
+            await show_admin_panel(message)
+            return
+        if session.stage == "awaiting_receipt":
+            await message.answer("To'lov chekini hujjat emas, rasm holatida yuboring.")
+            return
+        if session.stage not in ("choose_project", "collect_requirements"):
+            await message.answer("Fayl yuborish uchun avval /new orqali buyurtma boshlang.")
+            return
+        document = message.document
+        save_project_file(
+            message.from_user.id,
+            document.file_id,
+            "document",
+            document.file_name or "document",
+            session.order_id,
+        )
+        await message.answer(
+            f"Fayl qabul qilindi: {document.file_name or 'document'}\n"
+            "Endi loyiha nima qilishi kerakligini matn yoki ovoz bilan tushuntiring."
+        )
+
     @dp.message(F.photo)
     async def photo_handler(message: Message) -> None:
         session = get_session(message.from_user.id)
         if session.stage == "checking":
             await message.answer(
                 "To'lov chekingiz adminga yuborilgan. Iltimos, admin javobini kuting."
+            )
+            return
+
+        if session.stage in ("choose_project", "collect_requirements"):
+            save_project_file(
+                message.from_user.id,
+                message.photo[-1].file_id,
+                "photo",
+                "project_photo.jpg",
+                session.order_id,
+            )
+            await message.answer(
+                "Loyiha rasmi qabul qilindi. Endi rasm nimani anglatishi va loyiha qanday ishlashini yozing."
             )
             return
 
@@ -3402,7 +4791,7 @@ async def main() -> None:
             "Iltimos, biroz kuting..."
         )
 
-        admin_ids = admin_chat_ids()
+        admin_ids = list(configured_admin_roles())
         if not admin_ids:
             logging.warning("Admin ID sozlanmagan, chek adminga yuborilmadi.")
             return
@@ -3494,6 +4883,9 @@ async def main() -> None:
         if not is_admin_user(callback.from_user.id):
             await callback.answer("Bu tugma faqat admin uchun.", show_alert=True)
             return
+        if not has_permission(callback.from_user.id, "payment"):
+            await callback.answer("Sizda to'lovni tekshirish ruxsati yo'q.", show_alert=True)
+            return
 
         parts = callback.data.split(":")
         if len(parts) not in (3, 4):
@@ -3513,6 +4905,7 @@ async def main() -> None:
         if action == "paid":
             update_order_status(order_id, "paid")
             update_order_metadata(order_id, pipeline_stage="in_progress")
+            log_audit(callback.from_user.id, "payment_paid", "order", order_id)
             if session and session.order_id == order_id:
                 session.stage = "completed"
             await bot.send_message(
@@ -3520,6 +4913,15 @@ async def main() -> None:
                 "To'lovingiz muvaffaqiyatli qabul qilindi! Barcha ma'lumotlar adminga yuborildi. "
                 "Adminimiz siz bilan tez orada aloqaga chiqadi, iltimos javobni kuting.",
             )
+            referrer_user_id = reward_referral_for_user(user_id)
+            if referrer_user_id is not None:
+                try:
+                    await bot.send_message(
+                        referrer_user_id,
+                        "Referral orqali taklif qilgan mijozingiz buyurtma boshladi. Referral mukofotingiz qayd etildi.",
+                    )
+                except Exception:
+                    pass
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
             except TelegramBadRequest:
@@ -3530,6 +4932,7 @@ async def main() -> None:
         if action == "not_paid":
             update_order_status(order_id, "rejected")
             update_order_metadata(order_id, pipeline_stage="priced")
+            log_audit(callback.from_user.id, "payment_rejected", "order", order_id)
             if session and session.order_id == order_id:
                 session.stage = "payment_confirmation"
             await bot.send_message(
@@ -3564,6 +4967,7 @@ async def main() -> None:
             if not add_order_note(order_id, message.from_user.id, text):
                 await message.answer("Buyurtma topilmadi.", reply_markup=admin_panel_keyboard())
             else:
+                log_audit(message.from_user.id, "note_add", "order", order_id, text)
                 await message.answer(f"Buyurtma #{order_id} uchun izoh saqlandi.", reply_markup=admin_panel_keyboard())
             session.pending_note_order_id = None
             session.stage = "choose_project"
@@ -3578,6 +4982,7 @@ async def main() -> None:
             if not add_order_task(order_id, text):
                 await message.answer("Buyurtma topilmadi.", reply_markup=admin_panel_keyboard())
             else:
+                log_audit(message.from_user.id, "task_add", "order", order_id, text)
                 await message.answer(f"Buyurtma #{order_id} uchun task saqlandi.", reply_markup=admin_panel_keyboard())
             session.pending_task_order_id = None
             session.stage = "choose_project"
@@ -3598,6 +5003,18 @@ async def main() -> None:
             await message.answer(
                 f"Broadcast matni:\n\n{text}\n\nYuborilsinmi?",
                 reply_markup=broadcast_confirm_keyboard(),
+            )
+            return
+
+        if not is_admin_user(message.from_user.id) and session.stage == "support_message":
+            ticket_id = create_support_ticket(message.from_user, text)
+            session.stage = "choose_project"
+            await message.answer(f"Support murojaatingiz qabul qilindi. Ticket #{ticket_id}.")
+            await notify_admins(
+                bot,
+                f"Yangi support ticket #{ticket_id}\n"
+                f"Mijoz: {message.from_user.full_name} (@{message.from_user.username or 'username yoq'})\n"
+                f"Xabar: {text}",
             )
             return
 
@@ -3682,51 +5099,7 @@ async def main() -> None:
             return
 
         if session.stage in ("choose_project", "collect_requirements"):
-            await message.answer("Xabaringiz AI orqali tekshirilyapti...")
-            result = await guide_conversation_with_ai(session, text)
-
-            if not result.relevant:
-                session.off_topic_count += 1
-                await message.answer(
-                    result.reply,
-                    reply_markup=requirements_keyboard(bool(session.requirements))
-                    if session.stage == "collect_requirements"
-                    else welcome_inline_keyboard(),
-                )
-                return
-
-            for project_key in result.suggested_projects:
-                session.selected_projects.add(project_key)
-
-            if not session.selected_projects:
-                await message.answer(
-                    result.reply or "Qaysi loyiha turini tanlaysiz?",
-                    reply_markup=project_keyboard(session.selected_projects),
-                )
-                return
-
-            captured_requirements = result.captured_requirements or text
-            add_requirements_text(session, captured_requirements)
-            if has_online_payment_request(text):
-                await message.answer(
-                    "Loyihangiz ichidagi to'lov funksiyasi uchun Click, Payme, Paynet, karta va boshqa online to'lov integratsiyalariga ruxsat berilmaydi. "
-                    "Bu funksiya faqat naqd to'lov siyosati bilan qabul qilinadi."
-                )
-
-            validation = await validate_requirements_with_ai(session)
-            if not validation.enough:
-                session.requirements_validated = False
-                session.asked_questions += 1
-                await message.answer(validation.reply, reply_markup=requirements_reply_keyboard())
-                await message.answer(
-                    f"Tanlangan yo'nalish: {selected_project_titles(session)}\n"
-                    "Talablar hali yetarli emas. Yuqoridagi savollarga javob yozing.",
-                    reply_markup=requirements_keyboard(has_requirements=False),
-                )
-                return
-
-            session.requirements_validated = True
-            await finalize_estimate(message, message.from_user, session, bot=bot)
+            await process_customer_project_text(message, text, session, bot)
             return
 
         await show_main_menu(message, user_id=message.from_user.id)
@@ -3735,6 +5108,8 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         reminder_task.cancel()
+        monitor_task.cancel()
+        await asyncio.gather(reminder_task, monitor_task, return_exceptions=True)
         if web_runner is not None:
             await web_runner.cleanup()
 

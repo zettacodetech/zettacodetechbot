@@ -30,10 +30,15 @@ CARD_NUMBER=karta_raqami
 CARD_HOLDER=karta_egasi
 GROQ_API_KEY=groq_api_key
 GROQ_MODEL=llama-3.1-8b-instant
+GROQ_WHISPER_MODEL=whisper-large-v3-turbo
 PROMO_CODES=ZETTA10:10,START5:5
-WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/
+ADMIN_ROLES=admin_id:super_admin,sotuvchi_id:sales
+WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/app
 WEB_APP_BUTTON_TEXT=Web App
+WEBAPP_AUTH_MAX_AGE=86400
+WEBAPP_ALLOW_LOCAL_TEST=1
 REMINDER_AFTER_HOURS=24
+DAILY_REPORT_HOUR=20
 WEB_ADMIN_ENABLED=1
 WEB_ADMIN_HOST=127.0.0.1
 WEB_ADMIN_PORT=8088
@@ -51,7 +56,8 @@ python main.py
 
 Bot bilan birga yengil aiohttp web server ishlaydi:
 
-- `/` — Telegram menyu tugmasidagi **Web App** (ZettaCode Tech narx kalkulyatori, `webapp/index.html`). Ochiq, token talab qilmaydi.
+- `/` va `/app` — mijoz WebApp: buyurtma, status, portfolio va support.
+- `/api/webapp/*` — Telegram `initData` imzosi bilan himoyalangan WebApp API.
 - `/admin?token=...` — buyurtmalar admin paneli (token bilan himoyalangan).
 - `/admin/order/{id}?token=...` — buyurtma tafsiloti.
 
@@ -64,7 +70,7 @@ Repo GitHubda: `https://github.com/zettacodetech/zettacodetechbot.git`. Railway 
 1. Railwayda **New Project → Deploy from GitHub repo** → `zettacodetechbot` ni tanlang.
 2. **Variables** bo'limiga `.env` dagi barcha o'zgaruvchilarni qo'shing (`.env` git'ga yuklanmaydi). Eng muhimi:
    - `BOT_TOKEN`, `ADMIN_CHAT_ID`, `ADMIN_CHAT_IDS`, `GROQ_API_KEY`, `CARD_NUMBER`, `CARD_HOLDER`
-   - `WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/`
+   - `WEB_APP_URL=https://zettacodetechbot-production.up.railway.app/app`
    - `WEB_ADMIN_TOKEN=...` (kuchli token tanlang)
    - `PORT` ni **qo'lda kiritmang** — Railway o'zi beradi.
 3. **Settings → Networking → Generate Domain** orqali `zettacodetechbot-production.up.railway.app` domeni ochiladi. `WEB_APP_URL` shu domenga mos bo'lsin.
@@ -85,6 +91,10 @@ User commandlar:
 - `/contact` - admin bilan aloqa
 - `/status` - mijozning oxirgi buyurtma holati
 - `/invoice` - mijozning oxirgi buyurtmasi uchun invoice PDF
+- `/support MATN` - support ticket ochish
+- `/meeting YYYY-MM-DD HH:MM` - uchrashuv so'rash
+- `/referral` - referral kod va statistikani ko'rish
+- `/ref KOD` - referral kodni ishlatish
 - `/faq` - ko'p beriladigan savollar
 - `/promo PROMOKOD` - promo kod kiritish
 - `/help` - yordam
@@ -104,10 +114,17 @@ Admin commandlar:
 - `/stage BUYURTMA_ID BOSQICH` - CRM pipeline bosqichini o'zgartirish
 - `/task BUYURTMA_ID matn` - buyurtmaga vazifa qo'shish
 - `/tasks BUYURTMA_ID` - buyurtma vazifalarini ko'rish
+- `/files BUYURTMA_ID` - loyiha fayllarini olish
 - `/done TASK_ID` - vazifani bajarildi qilish
 - `/deadline BUYURTMA_ID YYYY-MM-DD` - deadline qo'yish
 - `/assign BUYURTMA_ID ism` - mas'ul admin/xodim biriktirish
 - `/web` - web admin panel havolasi
+- `/audit [BUYURTMA_ID]` - admin amallari tarixini ko'rish
+- `/tickets`, `/reply`, `/closeticket` - support ticketlarni boshqarish
+- `/meetings`, `/confirmmeeting` - uchrashuvlarni boshqarish
+- `/role USER_ID ROLE`, `/admins` - admin rollarini boshqarish
+- `/aireport` - AI savdo tahlili
+- `/health` - bot, database va monitoring holati
 - `/export` - buyurtmalarni CSV fayl qilib olish
 - `/broadcast matn` - barcha mijozlarga xabar yuborish
 - `/block USER_ID sabab` - foydalanuvchini bloklash
@@ -165,7 +182,14 @@ Admin ID `.env` dagi `ADMIN_CHAT_ID` yoki `ADMIN_CHAT_IDS` ichida bo'lsa, `/star
 
 ## Qo'shimcha funksiyalar
 
-- Telegram pastki `Menu` tugmasi `WEB_APP_URL` dagi Web Appni ochadi. URL HTTPS bo'lishi shart.
+- Telegram pastki `Menu` tugmasi `WEB_APP_URL` dagi WebAppni ochadi. URL HTTPS bo'lishi va `/app` yo'liga olib borishi kerak.
+- Mijoz WebApp orqali loyiha yuboradi, narx/statusni ko'radi, portfolio bilan tanishadi va support ticket ochadi.
+- Ovozli talablar Groq Whisper orqali matnga aylantiriladi.
+- Loyiha rasmi va hujjatlari buyurtmaga biriktiriladi.
+- Support ticket, uchrashuv, referral, admin audit log va rollar bazada saqlanadi.
+- Admin rollari: `super_admin`, `sales`, `developer`, `payment`.
+- `/aireport` savdo statistikasi asosida AI tavsiyalarini beradi.
+- Monitoring har 5 daqiqada database heartbeat yozadi va `DAILY_REPORT_HOUR` vaqtida adminlarga kunlik hisobot yuboradi.
 - CRM pipeline: `new`, `requirements`, `priced`, `prepayment`, `in_progress`, `done`.
 - Avtomatik eslatma: narx olgan, chek yubormagan yoki admin bilan kelishishga o'tgan mijozlarga `REMINDER_AFTER_HOURS` soatdan keyin xabar yuboriladi.
 - AI va fallback baholash: narx bilan birga taxminiy muddat va lead score chiqadi.
