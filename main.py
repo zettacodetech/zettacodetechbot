@@ -310,6 +310,7 @@ rate_limits: Dict[int, list[float]] = {}
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 SESSION_TTL_SECONDS = 86400
 _redis = None
+_sentry = None
 if REDIS_URL:
     try:
         import redis as _redis_lib  # noqa: E402
@@ -4645,6 +4646,22 @@ async def send_payment_details(message: Message, session: UserSession) -> None:
 async def main() -> None:
     load_dotenv(dotenv_path=".env")
     logging.basicConfig(level=logging.INFO)
+
+    sentry_dsn = os.getenv("SENTRY_DSN", "").strip()
+    if sentry_dsn:
+        try:
+            import sentry_sdk
+
+            sentry_sdk.init(
+                dsn=sentry_dsn,
+                traces_sample_rate=0.0,
+                environment=os.getenv("SENTRY_ENV", "production"),
+            )
+            globals()["_sentry"] = sentry_sdk
+            logging.info("Sentry xato kuzatuvi yoqildi")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Sentry yoqilmadi: %s", exc)
+
     init_db()
 
     bot_token = os.getenv("BOT_TOKEN")
@@ -4653,6 +4670,16 @@ async def main() -> None:
 
     bot = Bot(token=bot_token)
     dp = Dispatcher()
+
+    @dp.errors()
+    async def on_error(event: Any) -> bool:
+        exc = getattr(event, "exception", None)
+        logging.exception("Handler xatosi: %s", exc)
+        sentry = globals().get("_sentry")
+        if sentry is not None and exc is not None:
+            sentry.capture_exception(exc)
+        return True
+
     security_middleware = SecurityMiddleware()
     dp.message.middleware(security_middleware)
     dp.callback_query.middleware(security_middleware)
